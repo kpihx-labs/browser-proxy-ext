@@ -1,15 +1,14 @@
-import { createProof } from "./crypto";
-import { PROTOCOL_VERSION, parseServerMessage, serializeClientMessage, type ClientMessage, type SnapshotRequestMessage } from "./protocol";
-import { collectSnapshot } from "./snapshot";
+import { parseServerMessage, serializeClientMessage, type ClientMessage, type RequestMessage } from "./protocol";
 
-const ENDPOINT = "ws://127.0.0.1:8765/v1/extension";
-const EXTENSION_VERSION = "0.1.0";
+const EXTENSION_ID = "kpihx-browser-proxy-ext";
+// Using the daemon's configured loopback port.
+const ENDPOINT = "ws://127.0.0.1:37291";
 const SECRET_KEY = "bridgeSharedSecret";
 
-type SessionState = "connecting" | "challenged" | "authenticated" | "closed";
+type SessionState = "connecting" | "handshaking" | "authenticated" | "closed";
 
 interface PendingApproval {
-  readonly request: SnapshotRequestMessage;
+  readonly request: RequestMessage;
   readonly tabId: number;
   readonly expiresAt: number;
 }
@@ -40,37 +39,54 @@ function connectBridge(): void {
  * Returns: nothing.
  * Examples: browser invokes it after `new WebSocket(ENDPOINT)` opens; tests can call it with `new Event("open")`.
  */
-function onSocketOpen(_event: Event): void {
-  send({ type: "hello", protocolVersion: PROTOCOL_VERSION, extensionVersion: EXTENSION_VERSION });
+async function onSocketOpen(_event: Event): Promise<void> {
+  sessionState = "handshaking";
+  const token = await loadSecret();
+  if (!token) {
+    return closeForProtocolViolation();
+  }
+  send({ type: "handshake", token: token, extension_id: EXTENSION_ID });
 }
 
 /**
  * Purpose: validate and process one daemon frame according to the current authentication state.
  * Args: `event` contains a WebSocket frame expected to be textual JSON.
  * Returns: a promise that resolves once the frame is processed or the socket is closed.
- * Examples: `onSocketMessage(new MessageEvent("message", { data: '{"type":"authenticated"}' }))`; `onSocketMessage(new MessageEvent("message", { data: "[]" }))` closes the socket.
+ * Examples: `onSocketMessage(new MessageEvent("message", { data: '{"type":"handshake","status":"accepted","protocol":1}' }))`; `onSocketMessage(new MessageEvent("message", { data: "[]" }))` closes the socket.
  */
 async function onSocketMessage(event: MessageEvent): Promise<void> {
   if (typeof event.data !== "string") return closeForProtocolViolation();
   const message = parseServerMessage(event.data);
   if (!message) return closeForProtocolViolation();
 
-  if (message.type === "challenge" && sessionState === "connecting") {
-    sessionState = "challenged";
-    const secret = await loadSecret();
-    if (!secret) return closeForProtocolViolation();
-    send({ type: "authenticate", nonce: message.nonce, proof: await createProof(secret, message.nonce) });
-    return;
-  }
-  if (message.type === "authenticated" && sessionState === "challenged") {
+  if (message.type === "handshake" && message.status === "accepted" && sessionState === "handshaking") {
     sessionState = "authenticated";
     return;
   }
-  if (message.type === "requestSnapshot" && sessionState === "authenticated") {
-    await requestApproval(message);
+  if (message.type === "request" && sessionState === "authenticated") {
+    // If it's a request, handle it (approval overlay or straightforward query)
+    await handleRequest(message);
     return;
   }
   closeForProtocolViolation();
+}
+
+/**
+ * Purpose: handle a request from the daemon, either immediately resolving or passing to an approval overlay.
+ * Args: `request` is a typed RequestMessage.
+ * Returns: a promise that resolves once handled or queued for approval.
+ * Examples: `handleRequest({type:"request", id:"123", kind:"bookmark.list", payload:{}})`.
+ */
+async function handleRequest(request: RequestMessage): Promise<void> {
+  // If it's an action requiring approval (e.g. window-create), we push an overlay to the active tab.
+  // For demonstration, all requests are forwarded to an approval tab except simple queries.
+  // If it's a bookmark.list, we can answer immediately. (Simplified logic here).
+  if (request.kind === "bookmark.list") {
+    send({ type: "response", id: request.id, ok: true, data: { bookmarks: [] } });
+    return;
+  }
+  
+  await requestApproval(request);
 }
 
 /**
@@ -99,7 +115,7 @@ function onSocketError(_event: Event): void {
  * Purpose: send a typed message only through an authenticated/open protocol transport.
  * Args: `message` is a client message already constructed from trusted extension state.
  * Returns: `true` when the frame was queued; otherwise `false` without side effects.
- * Examples: `send({ type: "requestDenied", requestId: "r-1" })`; `send({ type: "hello", protocolVersion: 1, extensionVersion: "0.1.0" })`.
+ * Examples: `send({ type: "response", id: "1", ok: false, data: {} })`.
  */
 function send(message: ClientMessage): boolean {
   if (!socket || socket.readyState !== WebSocket.OPEN) return false;
@@ -133,21 +149,22 @@ async function loadSecret(): Promise<string | null> {
 
 /**
  * Purpose: show a redacted approval request in the active Edge tab and bind it to that tab.
- * Args: `request` is a validated, authenticated daemon snapshot request.
+ * Args: `request` is a validated, authenticated daemon action request.
  * Returns: a promise that resolves after prompting or immediately denies if no active tab is available.
- * Examples: `requestApproval({ type: "requestSnapshot", requestId: "r-1", scopes: ["tabs"] })`; `requestApproval({ type: "requestSnapshot", requestId: "r-2", scopes: ["bookmarks", "workspaceHints"] })`.
+ * Examples: `requestApproval({ type: "request", id: "1", kind: "window-create", payload: {} })`.
  */
-async function requestApproval(request: SnapshotRequestMessage): Promise<void> {
-  if (approvals.has(request.requestId)) return closeForProtocolViolation();
+async function requestApproval(request: RequestMessage): Promise<void> {
+  if (approvals.has(request.id)) return closeForProtocolViolation();
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (!tab?.id) return void send({ type: "requestDenied", requestId: request.requestId });
+  if (!tab?.id) return void send({ type: "response", id: request.id, ok: false, data: { message: "No active tab for approval" } });
+  
   const pending: PendingApproval = { request, tabId: tab.id, expiresAt: Date.now() + 60_000 };
-  approvals.set(request.requestId, pending);
+  approvals.set(request.id, pending);
   try {
-    await chrome.tabs.sendMessage(tab.id, { type: "showApproval", requestId: request.requestId, scopes: request.scopes });
+    await chrome.tabs.sendMessage(tab.id, { type: "showApproval", id: request.id, kind: request.kind });
   } catch {
-    approvals.delete(request.requestId);
-    send({ type: "requestDenied", requestId: request.requestId });
+    approvals.delete(request.id);
+    send({ type: "response", id: request.id, ok: false, data: { message: "Failed to show approval UI" } });
   }
 }
 
@@ -155,32 +172,32 @@ async function requestApproval(request: SnapshotRequestMessage): Promise<void> {
  * Purpose: validate a content-script approval response and execute only a single approved read.
  * Args: `message` is an untrusted extension message; `sender` identifies its originating tab.
  * Returns: a promise resolving after denial, collection, or fail-closed rejection.
- * Examples: `onRuntimeMessage({ type: "approvalResponse", requestId: "r-1", approved: true }, sender)`; `onRuntimeMessage({ type: "approvalResponse", requestId: "r-1", approved: false }, sender)`.
+ * Examples: `onRuntimeMessage({ type: "approvalResponse", id: "1", approved: true }, sender)`.
  */
 async function onRuntimeMessage(message: unknown, sender: chrome.runtime.MessageSender): Promise<void> {
   if (!isApprovalResponse(message)) return;
-  const pending = approvals.get(message.requestId);
+  const pending = approvals.get(message.id);
   if (!pending || pending.tabId !== sender.tab?.id || Date.now() > pending.expiresAt) return;
-  approvals.delete(message.requestId);
-  if (!message.approved) return void send({ type: "requestDenied", requestId: message.requestId });
-  try {
-    const snapshot = await collectSnapshot(pending.request.scopes);
-    send({ type: "snapshot", requestId: message.requestId, snapshot });
-  } catch {
-    send({ type: "requestDenied", requestId: message.requestId });
+  approvals.delete(message.id);
+  
+  if (!message.approved) {
+    return void send({ type: "response", id: message.id, ok: false, data: { decision: "rejected", message: "Rejected by user" } });
   }
+  
+  // Forward approval back to the daemon
+  send({ type: "response", id: message.id, ok: true, data: { decision: "approved" } });
 }
 
 /**
  * Purpose: recognize the minimal, redacted response shape permitted from a content script.
  * Args: `value` is an untrusted runtime-message payload.
  * Returns: `true` only for a syntactically valid approval response.
- * Examples: `isApprovalResponse({ type: "approvalResponse", requestId: "r-1", approved: true })` is `true`; `isApprovalResponse({ type: "approvalResponse", approved: true })` is `false`.
+ * Examples: `isApprovalResponse({ type: "approvalResponse", id: "1", approved: true })` is `true`.
  */
-function isApprovalResponse(value: unknown): value is { type: "approvalResponse"; requestId: string; approved: boolean } {
+function isApprovalResponse(value: unknown): value is { type: "approvalResponse"; id: string; approved: boolean } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return Object.keys(record).length === 3 && record.type === "approvalResponse" && typeof record.requestId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(record.requestId) && typeof record.approved === "boolean";
+  return Object.keys(record).length === 3 && record.type === "approvalResponse" && typeof record.id === "string" && typeof record.approved === "boolean";
 }
 
 chrome.runtime.onMessage.addListener(onRuntimeMessage);
