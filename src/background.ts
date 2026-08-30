@@ -372,30 +372,42 @@ async function describeApprovalDetails(request: RequestMessage): Promise<string[
     }
     lines.push(`${field}: ${JSON.stringify(value)}`);
   }
-  const illustrations = await describeNativeReferences(actionPayload);
+  const actionName = typeof request.payload.action === "string" ? request.payload.action : "";
+  const illustrations = await describeNativeReferences(actionName, actionPayload);
   if (illustrations.length > 0) lines.push("", ...illustrations);
   return lines;
 }
 
+/** Real gated action names whose `ids` field holds extension ids, never bookmark ids — resolved
+ * via `describeExtensionContext`, disambiguated from `bookmark-remove`'s own `ids` field (same
+ * field name, different meaning) by the real action name. */
+const EXTENSION_ID_ACTIONS = new Set(["extension-disable"]);
+
 /**
  * Purpose: resolve NATIVE chrome reference ids (never opaque CDP ids — those are the daemon's own
  * `"context"` field, see above) into human-readable illustrations for the approval overlay.
- * Args: `payload` is the real gated action's own payload (`request.payload.payload`).
+ * Args: `actionName` is the real gated action name (`request.payload.action`), used ONLY to
+ * disambiguate `ids` between bookmark ids and extension ids (`EXTENSION_ID_ACTIONS`) — nothing
+ * else in this function branches on it; `payload` is that action's own payload
+ * (`request.payload.payload`).
  * Returns: extra lines to append after the raw field dump — a window's real tabs, a group's real
- * name+tabs, each resolved tab's real title+url, or a bookmark's real title+url; `[]` when the
- * payload carries no recognizable native id at all (e.g. `cookie-set`).
- * Examples: `describeNativeReferences({group_id: 5})` resolves group 5's CURRENT title/color/tabs
- * (KπX: "son nom très important" — renaming a group needs its EXISTING name shown, not just the
- * proposed new one already visible in the raw field dump above); `describeNativeReferences(
- * {tab_ids: [1,2]})` resolves both tabs' real title/url; `describeNativeReferences({layout: [
- * {type:"tab",tab_id:1},{type:"group",tab_ids:[2,3]}]})` resolves every real tab id referenced
- * ANYWHERE inside `layout` (used by both `group-sync` and `window-sync` — same nested schema, one
- * shared illustration path, never a `layout`-only special case duplicated per action);
- * `describeNativeReferences({ids:["42"]})` resolves bookmark `"42"`'s real title/url;
- * `describeNativeReferences({items:[{id:"42",title:"New"}]})` resolves bookmark `"42"`'s CURRENT
- * title/url (the same "current state before the change" rationale as `group-update`).
+ * name+tabs, each resolved tab's real title+url, a bookmark's real title+url, or an extension's
+ * real name+version+enabled state; `[]` when the payload carries no recognizable native id at all
+ * (e.g. `cookie-set`).
+ * Examples: `describeNativeReferences("group-update", {group_id: 5})` resolves group 5's CURRENT
+ * title/color/tabs (KπX: "son nom très important" — renaming a group needs its EXISTING name
+ * shown, not just the proposed new one already visible in the raw field dump above);
+ * `describeNativeReferences("group-create", {tab_ids: [1,2]})` resolves both tabs' real title/url;
+ * `describeNativeReferences("window-sync", {layout: [{type:"tab",tab_id:1},{type:"group",
+ * tab_ids:[2,3]}]})` resolves every real tab id referenced ANYWHERE inside `layout` (the standalone
+ * `group-sync` action was purged — this same nested schema is reached only through `window-sync`
+ * now, still handled identically here);
+ * `describeNativeReferences("bookmark-remove", {ids:["42"]})` resolves bookmark `"42"`'s real
+ * title/url; `describeNativeReferences("extension-disable", {ids:["abc"]})` resolves extension
+ * `"abc"`'s real name/version/enabled state instead — same field name, different meaning,
+ * resolved correctly by `actionName`.
  */
-async function describeNativeReferences(payload: Record<string, unknown>): Promise<string[]> {
+async function describeNativeReferences(actionName: string, payload: Record<string, unknown>): Promise<string[]> {
   const lines: string[] = [];
   if (typeof payload.group_id === "number") lines.push(...(await describeGroupContext(payload.group_id)));
   if (typeof payload.window_id === "number") lines.push(...(await describeWindowContext(payload.window_id)));
@@ -414,6 +426,13 @@ async function describeNativeReferences(payload: Record<string, unknown>): Promi
     }
     if (layoutTabIds.size > 0) lines.push(...(await describeTabsContext([...layoutTabIds])));
   }
+  if (EXTENSION_ID_ACTIONS.has(actionName)) {
+    const extensionIds = Array.isArray(payload.ids)
+      ? payload.ids.filter((value): value is string => typeof value === "string")
+      : [];
+    for (const id of extensionIds) lines.push(...(await describeExtensionContext(id)));
+    return lines;
+  }
   const bookmarkIds = new Set<string>();
   if (Array.isArray(payload.ids)) {
     for (const id of payload.ids) if (typeof id === "string") bookmarkIds.add(id);
@@ -427,6 +446,24 @@ async function describeNativeReferences(payload: Record<string, unknown>): Promi
   }
   for (const id of bookmarkIds) lines.push(...(await describeBookmarkContext(id)));
   return lines;
+}
+
+/**
+ * Purpose: describe one real installed extension's name, version, and enabled state, for
+ * `extension-enable`/`extension-disable` specifically.
+ * Args: `extensionId` is the real `chrome.management` extension id about to be mutated.
+ * Returns: one `"extension <id>: \"<name>\" vX.Y.Z (enabled|disabled)"` line, or an unavailable
+ * line if it no longer exists (already uninstalled, or an invalid id).
+ * Examples: `await describeExtensionContext("abc")` resolves live `chrome.management.get`; an
+ * unknown id resolves to `"extension abc: (could not be resolved — may no longer exist)"`.
+ */
+async function describeExtensionContext(extensionId: string): Promise<string[]> {
+  try {
+    const info = await chrome.management.get(extensionId);
+    return [`extension ${extensionId}: "${info.name}" v${info.version} (${info.enabled ? "enabled" : "disabled"})`];
+  } catch {
+    return [`extension ${extensionId}: (could not be resolved — may no longer exist)`];
+  }
 }
 
 /**
@@ -1238,6 +1275,183 @@ export async function handleBookmarkUpdate(payload: unknown): Promise<Record<str
   return { updated };
 }
 
+/**
+ * Purpose: validate a batch id-list payload shared by every `extension-*` mutating action.
+ * Args: `value` is the untrusted request payload.
+ * Returns: `true` for `{ids: string[]}`, non-empty, every element a non-empty string.
+ * Examples: `isExtensionIdsPayload({ids:["abc"]})` is `true`; `isExtensionIdsPayload({ids:[]})` is
+ * `false`.
+ */
+function isExtensionIdsPayload(value: unknown): value is { ids: string[] } {
+  return (
+    isPlainRecord(value) &&
+    Array.isArray(value.ids) &&
+    value.ids.length > 0 &&
+    value.ids.every((id): id is string => typeof id === "string" && id.length > 0)
+  );
+}
+
+/**
+ * Purpose: build ONE fully-detailed description of an installed extension/app/theme — every real
+ * `chrome.management.ExtensionInfo` field PLUS human-readable permission warnings (never just the
+ * raw permission strings alone), so a caller never has to make a second round trip to understand
+ * what an extension can actually do.
+ * Args: `info` is one real node from `chrome.management.getAll()`/`get()`.
+ * Returns: a flat, JSON-serializable record — `permission_warnings` are the same human-readable
+ * strings Chrome itself would show a user before granting an extension its permissions (e.g.
+ * "Read and change your bookmarks", "Read and change all your data on all websites").
+ * Examples: `describeInstalledExtension({id:"abc",name:"X",...})` includes `permissions`,
+ * `host_permissions`, AND `permission_warnings` together — never permissions without their
+ * human-readable meaning.
+ */
+async function describeInstalledExtension(info: chrome.management.ExtensionInfo): Promise<Record<string, unknown>> {
+  const permissionWarnings = await chrome.management.getPermissionWarningsById(info.id).catch(() => [] as string[]);
+  return {
+    id: info.id,
+    name: info.name,
+    short_name: info.shortName,
+    version: info.version,
+    description: info.description,
+    type: info.type,
+    enabled: info.enabled,
+    may_disable: info.mayDisable,
+    install_type: info.installType,
+    offline_enabled: info.offlineEnabled,
+    homepage_url: info.homepageUrl ?? null,
+    update_url: info.updateUrl ?? null,
+    options_url: info.optionsUrl || null,
+    permissions: info.permissions,
+    host_permissions: info.hostPermissions,
+    permission_warnings: permissionWarnings,
+    icons: (info.icons ?? []).map((icon) => ({ url: icon.url, size: icon.size })),
+  };
+}
+
+/**
+ * Purpose: list EVERY installed extension/app/theme in this Edge profile with full detail —
+ * absolute finesse, "tout ce qu'on peut savoir" about the whole extension ecosystem, not just
+ * ours (KπX, GRAVÉ: "gérer les extensions... est-ce que c'est possible, fait des recherches").
+ * Args: none.
+ * Returns: `{extensions: [...]}` — one fully-detailed entry per installed item (see
+ * `describeInstalledExtension`), including this extension itself.
+ * Examples: `handleExtensionList()` includes at least the calling extension itself among the
+ * results; a freshly-installed unrelated extension appears with `enabled:true`, its real
+ * `permissions`/`host_permissions`, and their human-readable `permission_warnings`.
+ */
+export async function handleExtensionList(): Promise<Record<string, unknown>> {
+  const all = await chrome.management.getAll();
+  const extensions = await Promise.all(all.map((info) => describeInstalledExtension(info)));
+  return { extensions };
+}
+
+/**
+ * Purpose: read ALL available detail about ONE installed extension/app/theme by id — same
+ * "everything about ONE X" philosophy as `tab-get`/`bookmark-get`, extended to extensions.
+ * Args: `payload` must be `{id: string}` — a real `chrome.management` extension id.
+ * Returns: one fully-detailed entry (see `describeInstalledExtension`).
+ * Examples: `handleExtensionGet({id:"<our-own-id>"})` returns our own extension's full detail,
+ * including its own declared `permissions`; an unknown id rejects with a clear error.
+ */
+export async function handleExtensionGet(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isPlainRecord(payload) || typeof payload.id !== "string" || payload.id.length === 0) {
+    throw new Error("extension.get requires {id: string}");
+  }
+  const info = await chrome.management.get(payload.id);
+  return describeInstalledExtension(info);
+}
+
+/**
+ * Purpose: refuse to let any batch `extension-*` mutation target THIS SAME extension — disabling
+ * ourselves through this exact channel would sever the very bridge connection carrying the
+ * request mid-flight, with no clean way to confirm the result; `extension-reload` is the
+ * deliberate, safe, self-only equivalent instead.
+ * Args: `id` is one real extension id about to be enabled/disabled; `actionHint` names the calling
+ * action for the error message.
+ * Returns: nothing when `id` is NOT this same extension.
+ * Raises: a clear error naming `extension-reload` as the correct alternative, when `id` IS this
+ * same extension.
+ * Examples: `rejectSelfTarget("some-other-id", "extension.disable")` resolves normally;
+ * `rejectSelfTarget(ownId, "extension.disable")` rejects, pointing at `extension-reload`.
+ */
+async function rejectSelfTarget(id: string, actionHint: string): Promise<void> {
+  const self = await chrome.management.getSelf();
+  if (id === self.id) {
+    throw new Error(`${actionHint}: refusing to target this same extension (id "${id}") — use extension-reload instead`);
+  }
+}
+
+/**
+ * Purpose: enable or disable one or MORE installed extensions, batch, in ONE call — the shared
+ * implementation behind both `extension-enable` and `extension-disable`.
+ * Args: `payload` must satisfy `isExtensionIdsPayload`; `enabled` is the target state applied to
+ * every id in the batch.
+ * Returns: `{updated: [{id, name, enabled}, ...]}` — each entry's REAL post-mutation state.
+ * Raises: any id equal to this extension's own id (see `rejectSelfTarget`); an unknown id
+ * (`chrome.management.get` rejects naturally).
+ * Examples: `setExtensionsEnabled({ids:["abc","def"]}, false)` disables both in one call;
+ * `setExtensionsEnabled({ids:[ownId]}, false)` rejects, never disabling this extension itself.
+ */
+async function setExtensionsEnabled(payload: unknown, enabled: boolean): Promise<Record<string, unknown>> {
+  const actionHint = `extension.${enabled ? "enable" : "disable"}`;
+  if (!isExtensionIdsPayload(payload)) {
+    throw new Error(`${actionHint} requires {ids: string[]} (non-empty)`);
+  }
+  const updated: Array<Record<string, unknown>> = [];
+  for (const id of payload.ids) {
+    await rejectSelfTarget(id, actionHint);
+    await chrome.management.setEnabled(id, enabled);
+    const info = await chrome.management.get(id);
+    updated.push({ id: info.id, name: info.name, enabled: info.enabled });
+  }
+  return { updated };
+}
+
+/**
+ * Purpose: enable one or MORE installed extensions, batch, in ONE call — daemon-side, this is
+ * deliberately NOT approval-gated (KπX directive): re-enabling is low-risk and reversible, unlike
+ * `extension-disable` which keeps its approval gate.
+ * Args: `payload` must satisfy `isExtensionIdsPayload`.
+ * Returns: `{updated: [{id, name, enabled}, ...]}`.
+ * Examples: `handleExtensionEnable({ids:["abc"]})` re-enables one previously-disabled extension;
+ * `handleExtensionEnable({ids:["abc","def"]})` enables both in the same call.
+ */
+export async function handleExtensionEnable(payload: unknown): Promise<Record<string, unknown>> {
+  return setExtensionsEnabled(payload, true);
+}
+
+/**
+ * Purpose: disable one or MORE installed extensions, batch, in ONE call.
+ * Args: `payload` must satisfy `isExtensionIdsPayload`.
+ * Returns: `{updated: [{id, name, enabled}, ...]}`.
+ * Examples: `handleExtensionDisable({ids:["abc"]})` disables one extension;
+ * `handleExtensionDisable({ids:["abc","def"]})` disables both in the same call.
+ */
+export async function handleExtensionDisable(payload: unknown): Promise<Record<string, unknown>> {
+  return setExtensionsEnabled(payload, false);
+}
+
+/**
+ * Purpose: restart THIS SAME extension's own service worker to pick up newly deployed code —
+ * "répondre avant de couper": the real response is scheduled to reach the daemon BEFORE the
+ * reload actually happens, never after (KπX, GRAVÉ: this exact reload used to require a manual
+ * click in `edge://extensions/` after every code change this session).
+ * Args: none.
+ * Returns: `{reloading: true, id, name, version}` (this SAME extension's own identity, via
+ * `chrome.management.getSelf()` — needs no "management" permission at all) — the WebSocket
+ * response carrying this value is sent by the caller (`handleRequest`'s own `send(...)`)
+ * synchronously right after this promise resolves; `chrome.runtime.reload()` is deliberately
+ * scheduled 200ms later via `setTimeout`, a full JS macrotask AFTER that `send()` already ran, so
+ * the daemon's response always leaves the process before the service worker actually restarts.
+ * Examples: `handleExtensionReload()` resolves immediately with this extension's own info, then
+ * the extension itself restarts ~200ms later — the daemon never sees a dropped connection before
+ * getting its answer.
+ */
+export async function handleExtensionReload(): Promise<Record<string, unknown>> {
+  const self = await chrome.management.getSelf();
+  setTimeout(() => chrome.runtime.reload(), 200);
+  return { reloading: true, id: self.id, name: self.name, version: self.version };
+}
+
 /** One real tab entry inside `computeWindowLayouts()`'s per-window canonical layout. */
 interface WindowLayoutTab {
   readonly chrome_tab_id: number;
@@ -1695,7 +1909,10 @@ function isGroupSyncPayload(value: unknown): value is { layout: GroupSyncEntry[]
 /**
  * Purpose: reorganize a WHOLE window's tab/group structure in one call — total flexibility (create,
  * rename, recolor, add-to, remove-from, and reposition, all at once), never N separate
- * approval-free calls for what is conceptually one deliberate rearrangement.
+ * approval-free calls for what is conceptually one deliberate rearrangement. Called ONLY via
+ * `window-sync`'s own `layout` field now (KπX, GRAVÉ: "purge group-sync vu que inclus ds
+ * window-sync") — the standalone daemon action `group-sync` was purged as a strict subset of
+ * `window-sync`; this bridge kind (`group.sync`) itself still exists, unchanged, internal-only.
  * Args: `payload` must be `{layout: [...]}`, an ORDERED list processed left to right, each entry
  * either `{type:"tab",tab_id}` (a standalone, ungrouped tab at this position) or
  * `{type:"group",group_id?,title?,color?,tab_ids}` (a whole group at this position — `group_id`
@@ -1902,6 +2119,11 @@ export const KIND_HANDLERS: Record<string, KindHandler> = {
   "bookmark.create": (payload) => handleBookmarkCreate(payload),
   "bookmark.remove": (payload) => handleBookmarkRemove(payload),
   "bookmark.update": (payload) => handleBookmarkUpdate(payload),
+  "extension.list": () => handleExtensionList(),
+  "extension.get": (payload) => handleExtensionGet(payload),
+  "extension.enable": (payload) => handleExtensionEnable(payload),
+  "extension.disable": (payload) => handleExtensionDisable(payload),
+  "extension.reload": () => handleExtensionReload(),
   "group.list": () => handleGroupList(),
   "group.create": (payload) => handleGroupCreate(payload),
   "group.update": (payload) => handleGroupUpdate(payload),

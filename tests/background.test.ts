@@ -1,5 +1,9 @@
 import { beforeAll, describe, expect, mock, test } from "bun:test";
 
+/** This extension's own id, shared between the `chrome.management` mock factory and the tests
+ * that assert self-target rejection (`extension-enable`/`disable` vs `extension-reload`). */
+const OWN_ID = "own-extension-id";
+
 /**
  * Purpose: a `WebSocket` that never actually touches the network, replacing the real one.
  * Args: constructor takes and ignores a URL, matching the real `WebSocket` constructor shape.
@@ -99,6 +103,67 @@ function installChromeMock() {
     },
   ]);
 
+  type MockExtensionInfo = {
+    id: string;
+    name: string;
+    shortName?: string;
+    version?: string;
+    description?: string;
+    type?: string;
+    enabled: boolean;
+    mayDisable?: boolean;
+    installType?: string;
+    offlineEnabled?: boolean;
+    homepageUrl?: string;
+    updateUrl?: string;
+    optionsUrl?: string;
+    permissions?: string[];
+    hostPermissions?: string[];
+    icons?: Array<{ url: string; size: number }>;
+  };
+  const managementGetSelf = mock(
+    async (): Promise<MockExtensionInfo> => ({
+      id: OWN_ID,
+      name: "Browser Proxy Bridge for Microsoft Edge",
+      shortName: "Browser Proxy Bridge",
+      version: "0.2.0",
+      description: "A local, approval-gated bridge.",
+      type: "extension",
+      enabled: true,
+      mayDisable: true,
+      installType: "development",
+      offlineEnabled: false,
+      optionsUrl: "chrome-extension://own-extension-id/options.html",
+      permissions: ["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management"],
+      hostPermissions: [],
+      icons: [],
+    }),
+  );
+  const managementGetAll = mock(async (): Promise<MockExtensionInfo[]> => [await managementGetSelf()]);
+  const managementGet = mock(
+    async (id: string): Promise<MockExtensionInfo> => ({
+      id,
+      name: "Some Extension",
+      shortName: "Some Extension",
+      version: "1.0.0",
+      description: "A third-party extension.",
+      type: "extension",
+      enabled: true,
+      mayDisable: true,
+      installType: "normal",
+      offlineEnabled: false,
+      optionsUrl: "",
+      permissions: ["storage"],
+      hostPermissions: ["<all_urls>"],
+      icons: [],
+    }),
+  );
+  const managementSetEnabled = mock(async (_id: string, _enabled: boolean) => undefined);
+  const managementUninstall = mock(async (_id: string, _options?: { showConfirmDialog?: boolean }) => undefined);
+  const managementGetPermissionWarningsById = mock(async (_id: string): Promise<string[]> => [
+    "Read and change your data on all websites",
+  ]);
+
   const tabsGroup = mock(async (_options: { tabIds: number | number[] }) => 7);
   const tabGroupsUpdate = mock(async (id: number, props: { title?: string; color?: string; collapsed?: boolean }) => ({
     id,
@@ -157,6 +222,14 @@ function installChromeMock() {
       getSubTree: bookmarksGetSubTree,
       get: bookmarksGet,
     },
+    management: {
+      getSelf: managementGetSelf,
+      getAll: managementGetAll,
+      get: managementGet,
+      setEnabled: managementSetEnabled,
+      uninstall: managementUninstall,
+      getPermissionWarningsById: managementGetPermissionWarningsById,
+    },
     tabGroups: { update: tabGroupsUpdate, query: tabGroupsQuery, move: tabGroupsMove, get: tabGroupsGet },
     tabs: {
       group: tabsGroup,
@@ -205,6 +278,12 @@ function installChromeMock() {
     bookmarksGetTree,
     bookmarksGetSubTree,
     bookmarksGet,
+    managementGetSelf,
+    managementGetAll,
+    managementGet,
+    managementSetEnabled,
+    managementUninstall,
+    managementGetPermissionWarningsById,
     tabsGroup,
     tabGroupsUpdate,
     tabGroupsQuery,
@@ -514,6 +593,125 @@ describe("KIND_HANDLERS dispatch table", () => {
   test("bookmark.update rejects a no-op item (nothing to change beyond id)", async () => {
     const handler = getHandler("bookmark.update");
     await expect(handler({ items: [{ id: "42" }] })).rejects.toThrow();
+  });
+
+  test("extension.list returns full detail for EVERY installed extension, with human-readable permission_warnings", async () => {
+    const handler = getHandler("extension.list");
+    const result = (await handler({})) as { extensions: Array<Record<string, unknown>> };
+    expect(mocks.managementGetAll).toHaveBeenCalled();
+    expect(result.extensions).toHaveLength(1);
+    const own = result.extensions[0] as Record<string, unknown>;
+    expect(own.id).toBe(OWN_ID);
+    expect(own.name).toBe("Browser Proxy Bridge for Microsoft Edge");
+    expect(own.permissions).toEqual(["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management"]);
+    expect(own.permission_warnings).toEqual(["Read and change your data on all websites"]);
+  });
+
+  test("extension.get reads ALL available detail about ONE extension by id", async () => {
+    const handler = getHandler("extension.get");
+    const result = (await handler({ id: "other-id" })) as Record<string, unknown>;
+    expect(mocks.managementGet).toHaveBeenCalledWith("other-id");
+    expect(result.id).toBe("other-id");
+    expect(result.name).toBe("Some Extension");
+    expect(result.permission_warnings).toEqual(["Read and change your data on all websites"]);
+  });
+
+  test("extension.get rejects a malformed payload", async () => {
+    const handler = getHandler("extension.get");
+    await expect(handler({})).rejects.toThrow();
+  });
+
+  test("extension.enable enables a batch of extensions in ONE call", async () => {
+    const handler = getHandler("extension.enable");
+    const result = await handler({ ids: ["a", "b"] });
+    expect(mocks.managementSetEnabled).toHaveBeenNthCalledWith(1, "a", true);
+    expect(mocks.managementSetEnabled).toHaveBeenNthCalledWith(2, "b", true);
+    expect(result).toEqual({
+      updated: [
+        { id: "a", name: "Some Extension", enabled: true },
+        { id: "b", name: "Some Extension", enabled: true },
+      ],
+    });
+  });
+
+  test("extension.disable disables a batch of extensions in ONE call", async () => {
+    const handler = getHandler("extension.disable");
+    mocks.managementSetEnabled.mockClear();
+    await handler({ ids: ["a"] });
+    expect(mocks.managementSetEnabled).toHaveBeenCalledWith("a", false);
+  });
+
+  test("extension.enable refuses to target this same extension — points at extension-reload instead", async () => {
+    const handler = getHandler("extension.enable");
+    mocks.managementSetEnabled.mockClear();
+    await expect(handler({ ids: [OWN_ID] })).rejects.toThrow(/extension-reload/);
+    expect(mocks.managementSetEnabled).not.toHaveBeenCalled();
+  });
+
+  test("extension.disable refuses to target this same extension", async () => {
+    const handler = getHandler("extension.disable");
+    mocks.managementSetEnabled.mockClear();
+    await expect(handler({ ids: [OWN_ID] })).rejects.toThrow(/extension-reload/);
+    expect(mocks.managementSetEnabled).not.toHaveBeenCalled();
+  });
+
+  test("extension.enable/disable rejects a malformed payload", async () => {
+    const handler = getHandler("extension.enable");
+    await expect(handler({ ids: [] })).rejects.toThrow();
+    await expect(handler({})).rejects.toThrow();
+  });
+
+  test("extension.uninstall is deliberately not registered — chrome.management.uninstall() targeting another extension requires a genuine synchronous DOM user gesture, which a WebSocket-triggered call can never provide (live-verified, see CONTRACT.md)", () => {
+    expect(() => getHandler("extension.uninstall")).toThrow();
+  });
+
+  test("extension.reload responds with this extension's own identity BEFORE chrome.runtime.reload() ever fires", async () => {
+    const handler = getHandler("extension.reload");
+    const runtimeReload = mock(() => undefined);
+    (globalThis as { chrome: { runtime?: { reload?: () => void } } }).chrome.runtime = { reload: runtimeReload };
+    const result = await handler({});
+    expect(result).toEqual({
+      reloading: true,
+      id: OWN_ID,
+      name: "Browser Proxy Bridge for Microsoft Edge",
+      version: "0.2.0",
+    });
+    // The reload itself is scheduled, deliberately not fired synchronously within this same call.
+    expect(runtimeReload).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(runtimeReload).toHaveBeenCalledTimes(1);
+  });
+
+  test("the approval overlay illustrates a batch extension-disable's real name/version/enabled state, never a bare extension id", async () => {
+    mocks.tabsSendMessage.mockClear();
+    await background.handleRequest({
+      type: "request",
+      id: "req-approval-transparency-6",
+      kind: "approval",
+      payload: { action: "extension-disable", payload: { profile: "default", ids: ["other-id"] } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const [, message] = mocks.tabsSendMessage.mock.calls[0] as [number, { details: string[] }];
+    expect(message.details).toEqual([
+      "ids:",
+      "  other-id",
+      "",
+      'extension other-id: "Some Extension" v1.0.0 (enabled)',
+    ]);
+  });
+
+  test("the approval overlay still illustrates bookmark-remove's ids as bookmarks, never as extensions (disambiguated by action name)", async () => {
+    mocks.tabsSendMessage.mockClear();
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com" }]);
+    await background.handleRequest({
+      type: "request",
+      id: "req-approval-transparency-7",
+      kind: "approval",
+      payload: { action: "bookmark-remove", payload: { profile: "default", ids: ["42"] } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const [, message] = mocks.tabsSendMessage.mock.calls[0] as [number, { details: string[] }];
+    expect(message.details).toEqual(["ids:", "  42", "", 'bookmark 42: "KpihX Labs" (https://kpihx-labs.com)']);
   });
 
   test("group.create calls chrome.tabs.group then chrome.tabGroups.update with the right args", async () => {

@@ -3,7 +3,7 @@
   "name": "Browser Proxy Bridge for Microsoft Edge",
   "version": "0.2.0",
   "description": "A local, approval-gated bridge between Microsoft Edge and browser-proxyd.",
-  "permissions": ["bookmarks", "tabs", "tabGroups", "storage", "alarms"],
+  "permissions": ["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management"],
   "host_permissions": [],
   "background": {
     "service_worker": "dist/background.js",
