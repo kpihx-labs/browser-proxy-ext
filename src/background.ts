@@ -372,8 +372,7 @@ async function describeApprovalDetails(request: RequestMessage): Promise<string[
     }
     lines.push(`${field}: ${JSON.stringify(value)}`);
   }
-  const actionName = typeof request.payload.action === "string" ? request.payload.action : "";
-  const illustrations = await describeNativeReferences(actionName, actionPayload);
+  const illustrations = await describeNativeReferences(actionPayload);
   if (illustrations.length > 0) lines.push("", ...illustrations);
   return lines;
 }
@@ -381,21 +380,22 @@ async function describeApprovalDetails(request: RequestMessage): Promise<string[
 /**
  * Purpose: resolve NATIVE chrome reference ids (never opaque CDP ids — those are the daemon's own
  * `"context"` field, see above) into human-readable illustrations for the approval overlay.
- * Args: `actionName` is the real gated action name (`request.payload.action`); `payload` is that
- * action's real payload (`request.payload.payload`).
+ * Args: `payload` is the real gated action's own payload (`request.payload.payload`).
  * Returns: extra lines to append after the raw field dump — a window's real tabs, a group's real
  * name+tabs, each resolved tab's real title+url, or a bookmark's real title+url; `[]` when the
- * payload carries no recognizable native id at all (e.g. `cookie-set`, `bookmark-create`).
- * Examples: `describeNativeReferences("group-update", {group_id: 5})` resolves group 5's CURRENT
- * title/color/tabs (KπX: "son nom très important" — renaming a group needs its EXISTING name
- * shown, not just the proposed new one already visible in the raw field dump above);
- * `describeNativeReferences("group-create", {tab_ids: [1,2]})` resolves both tabs' real title/url;
- * `describeNativeReferences("group-sync", {layout: [{type:"tab",tab_id:1},{type:"group",
- * tab_ids:[2,3]}]})` resolves every real tab id referenced ANYWHERE inside `layout` (used by both
- * `group-sync` and `window-sync` — same nested schema, one shared illustration path, never a
- * `layout`-only special case duplicated per action).
+ * payload carries no recognizable native id at all (e.g. `cookie-set`).
+ * Examples: `describeNativeReferences({group_id: 5})` resolves group 5's CURRENT title/color/tabs
+ * (KπX: "son nom très important" — renaming a group needs its EXISTING name shown, not just the
+ * proposed new one already visible in the raw field dump above); `describeNativeReferences(
+ * {tab_ids: [1,2]})` resolves both tabs' real title/url; `describeNativeReferences({layout: [
+ * {type:"tab",tab_id:1},{type:"group",tab_ids:[2,3]}]})` resolves every real tab id referenced
+ * ANYWHERE inside `layout` (used by both `group-sync` and `window-sync` — same nested schema, one
+ * shared illustration path, never a `layout`-only special case duplicated per action);
+ * `describeNativeReferences({ids:["42"]})` resolves bookmark `"42"`'s real title/url;
+ * `describeNativeReferences({items:[{id:"42",title:"New"}]})` resolves bookmark `"42"`'s CURRENT
+ * title/url (the same "current state before the change" rationale as `group-update`).
  */
-async function describeNativeReferences(actionName: string, payload: Record<string, unknown>): Promise<string[]> {
+async function describeNativeReferences(payload: Record<string, unknown>): Promise<string[]> {
   const lines: string[] = [];
   if (typeof payload.group_id === "number") lines.push(...(await describeGroupContext(payload.group_id)));
   if (typeof payload.window_id === "number") lines.push(...(await describeWindowContext(payload.window_id)));
@@ -414,9 +414,18 @@ async function describeNativeReferences(actionName: string, payload: Record<stri
     }
     if (layoutTabIds.size > 0) lines.push(...(await describeTabsContext([...layoutTabIds])));
   }
-  if (actionName === "bookmark-remove" && typeof payload.id === "string") {
-    lines.push(...(await describeBookmarkContext(payload.id)));
+  const bookmarkIds = new Set<string>();
+  if (Array.isArray(payload.ids)) {
+    for (const id of payload.ids) if (typeof id === "string") bookmarkIds.add(id);
   }
+  if (Array.isArray(payload.items)) {
+    for (const entry of payload.items) {
+      if (!isPlainRecord(entry)) continue;
+      if (typeof entry.id === "string") bookmarkIds.add(entry.id);
+      if (typeof entry.parent_id === "string") bookmarkIds.add(entry.parent_id);
+    }
+  }
+  for (const id of bookmarkIds) lines.push(...(await describeBookmarkContext(id)));
   return lines;
 }
 
@@ -832,58 +841,401 @@ async function onRuntimeMessage(message: unknown, sender: chrome.runtime.Message
 // Real kind handlers — every entry performs the actual chrome.* operation.
 // ---------------------------------------------------------------------------
 
-/**
- * Purpose: validate that a value has a given set of required string/optional fields for bookmark payloads.
- * Args: `value` is the untrusted request payload.
- * Returns: `true` when `value` has a non-empty string `title` and `url`, and an optional string `parentId`.
- * Examples: `isBookmarkCreatePayload({title:"a",url:"https://x"})` is `true`; `isBookmarkCreatePayload({title:"a"})` is `false`.
- */
-function isBookmarkCreatePayload(value: unknown): value is { title: string; url: string; parentId?: string } {
-  if (!isPlainRecord(value)) return false;
-  return typeof value.title === "string" && typeof value.url === "string" && (value.parentId === undefined || typeof value.parentId === "string");
+/** One real bookmark tree node in `handleBookmarkList()`'s nested, profile-scoped result. */
+interface BookmarkListNode {
+  readonly id: string;
+  readonly title: string;
+  readonly type: "folder" | "bookmark";
+  readonly url: string | null;
+  readonly parent_id: string | null;
+  readonly index: number;
+  children?: BookmarkListNode[];
 }
 
 /**
- * Purpose: flatten `chrome.bookmarks.getTree()` into a real, profile-scoped bookmark list (folders included).
- * Args: `_payload` is unused (no filtering options today).
- * Returns: `{ bookmarks: [{id,title,url,parentId}] }` for every node in the tree.
- * Examples: `handleBookmarkList({})` returns every bookmark and folder in the profile; on an empty profile it returns `{ bookmarks: [] }` only for the implicit root nodes' folders.
+ * Purpose: build one nested `BookmarkListNode`, descending into `children` only up to `maxDepth`.
+ * Args: `node` is one real `chrome.bookmarks.BookmarkTreeNode`; `currentDepth` is how many levels
+ * below the returned roots this node already sits; `maxDepth` is the caller's requested ceiling
+ * (`null` means unlimited — the full tree).
+ * Returns: one `BookmarkListNode`; `children` is present (as a real, possibly empty, array) for
+ * folders only — bookmarks are leaves and never carry a `children` field at all.
+ * Examples: `buildBookmarkNode({id:"1",title:"Bar",parentId:"0",index:0,children:[]},0,0)` returns
+ * `{id:"1",title:"Bar",type:"folder",url:null,parent_id:"0",index:0,children:[]}` (depth 0 never
+ * descends); `buildBookmarkNode({id:"2",title:"X",url:"https://x",parentId:"1",index:0},0,null)`
+ * returns `{...,type:"bookmark",url:"https://x"}` with no `children` field at all.
  */
-export async function handleBookmarkList(): Promise<Record<string, unknown>> {
-  const roots = await chrome.bookmarks.getTree();
-  const bookmarks: Array<{ id: string; title: string; url: string | null; parentId: string | null }> = [];
-  const walk = (nodes: chrome.bookmarks.BookmarkTreeNode[]): void => {
-    for (const node of nodes) {
-      bookmarks.push({ id: node.id, title: node.title, url: node.url ?? null, parentId: node.parentId ?? null });
-      if (node.children) walk(node.children);
-    }
+function buildBookmarkNode(
+  node: chrome.bookmarks.BookmarkTreeNode,
+  currentDepth: number,
+  maxDepth: number | null,
+): BookmarkListNode {
+  const isFolder = node.url === undefined;
+  const result: BookmarkListNode = {
+    id: node.id,
+    title: node.title,
+    type: isFolder ? "folder" : "bookmark",
+    url: node.url ?? null,
+    parent_id: node.parentId ?? null,
+    index: node.index ?? 0,
   };
-  walk(roots);
-  return { bookmarks };
+  if (isFolder) {
+    const rawChildren = node.children ?? [];
+    result.children =
+      maxDepth === null || currentDepth < maxDepth
+        ? rawChildren.map((child) => buildBookmarkNode(child, currentDepth + 1, maxDepth))
+        : [];
+  }
+  return result;
 }
 
 /**
- * Purpose: create a real bookmark in the Edge profile via `chrome.bookmarks.create`.
- * Args: `payload` must be `{title, url, parentId?}`.
- * Returns: the created node as `{id,title,url,parentId}`.
- * Examples: `handleBookmarkCreate({title:"KpihX",url:"https://kpihx-labs.com"})`; `handleBookmarkCreate({title:"Docs",url:"https://x",parentId:"1"})`.
+ * Purpose: reveal the REAL folder/subfolder tree structure Edge bookmarks actually live in — a
+ * filesystem-like hierarchy, not a flat dump (KπX, GRAVÉ: "les bookmarks sont carrément comme un
+ * système de fichier avec dossier sous dossier... le list doit bien révéler cela"); optionally
+ * scoped to just ONE subfolder (KπX follow-up: "est-ce que ça permet de lister juste les bookmark
+ * d'un sous dossier ?").
+ * Args: `payload` may optionally carry `{depth?: number | null, root_id?: string}` — `depth` is
+ * how many levels below the returned roots to include (omitted/`null` = unbounded); `root_id`, if
+ * given, scopes the whole call to that ONE real folder id (via `chrome.bookmarks.getSubTree`)
+ * instead of the top-level roots — `depth` then counts from THAT folder, not from
+ * `Bookmarks bar`/`Other bookmarks`/`Mobile bookmarks`.
+ * Returns: `{depth, roots: BookmarkListNode[]}` — the invisible super-root (`chrome.bookmarks`
+ * id `"0"`) is never itself returned; without `root_id`, `roots` starts at its real children (the
+ * top-level folders); with `root_id`, `roots` is a single-element array holding that ONE requested
+ * folder (kept as a list, not a singular field, so callers never special-case the two modes).
+ * Raises: an unknown `root_id`, or one that names a bookmark LEAF rather than a folder, rejects
+ * clearly — a leaf has no subfolder tree to reveal.
+ * Examples: `handleBookmarkList({})` returns the full tree; `handleBookmarkList({depth:0})` returns
+ * only the top-level roots with empty `children` arrays; `handleBookmarkList({root_id:"29"})`
+ * returns just that one folder (and everything inside it), never anything else in the tree.
+ */
+export async function handleBookmarkList(payload: unknown): Promise<Record<string, unknown>> {
+  let maxDepth: number | null = null;
+  let rootId: string | undefined;
+  if (isPlainRecord(payload)) {
+    if (payload.depth !== undefined && payload.depth !== null) {
+      if (typeof payload.depth !== "number" || payload.depth < 0 || !Number.isInteger(payload.depth)) {
+        throw new Error("bookmark.list depth, when given, must be a non-negative integer or null");
+      }
+      maxDepth = payload.depth;
+    }
+    if (payload.root_id !== undefined) {
+      if (typeof payload.root_id !== "string" || payload.root_id.length === 0) {
+        throw new Error("bookmark.list root_id, when given, must be a non-empty string");
+      }
+      rootId = payload.root_id;
+    }
+  }
+  if (rootId !== undefined) {
+    const [rootNode] = await chrome.bookmarks.getSubTree(rootId);
+    if (!rootNode) throw new Error(`bookmark.list: root_id "${rootId}" does not exist`);
+    if (rootNode.url !== undefined) {
+      throw new Error(`bookmark.list: root_id "${rootId}" is a bookmark leaf, not a folder`);
+    }
+    return { depth: maxDepth, roots: [buildBookmarkNode(rootNode, 0, maxDepth)] };
+  }
+  const [superRoot] = await chrome.bookmarks.getTree();
+  const roots = (superRoot?.children ?? []).map((root) => buildBookmarkNode(root, 0, maxDepth));
+  return { depth: maxDepth, roots };
+}
+
+/**
+ * Purpose: read ALL available real information about ONE bookmark or folder in a single call —
+ * same "everything about ONE X in one call" philosophy as `tab-get`, extended to bookmarks (KπX,
+ * GRAVÉ: "un truc bookmark-get qui affiche toutes les infos sur un bookmark donné").
+ * Args: `payload` must be `{id: string}` — a real `chrome.bookmarks` node id.
+ * Returns: `{id, title, type, url, parent_id, parent_title, index, date_added}` always, plus, for a
+ * FOLDER, `{date_group_modified, children_count, children_preview: {first, last} | null}`; for a
+ * LEAF bookmark, `{date_last_used}` instead. `parent_title` is the immediate parent folder's real
+ * title (`null` only for the invisible super-root, which has no parent at all).
+ * Examples: `handleBookmarkGet({id:"29"})` on a folder returns its full identity plus a
+ * `children_count`/`first`/`last` preview (never the full subtree — see `bookmark-list` for that);
+ * `handleBookmarkGet({id:"42"})` on a leaf bookmark returns its `url`/`date_last_used`, no
+ * `children_*` fields at all.
+ */
+export async function handleBookmarkGet(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isPlainRecord(payload) || typeof payload.id !== "string" || payload.id.length === 0) {
+    throw new Error("bookmark.get requires {id: string}");
+  }
+  const [node] = await chrome.bookmarks.get(payload.id);
+  if (!node) throw new Error(`bookmark.get: id "${payload.id}" does not exist`);
+  let parentTitle: string | null = null;
+  if (node.parentId !== undefined) {
+    const parentNodes = await chrome.bookmarks.get(node.parentId).catch(() => []);
+    parentTitle = parentNodes[0]?.title ?? null;
+  }
+  const isFolder = node.url === undefined;
+  const result: Record<string, unknown> = {
+    id: node.id,
+    title: node.title,
+    type: isFolder ? "folder" : "bookmark",
+    url: node.url ?? null,
+    parent_id: node.parentId ?? null,
+    parent_title: parentTitle,
+    index: node.index ?? null,
+    date_added: node.dateAdded ?? null,
+  };
+  if (isFolder) {
+    const [subtree] = await chrome.bookmarks.getSubTree(payload.id);
+    const children = subtree?.children ?? [];
+    result.date_group_modified = node.dateGroupModified ?? null;
+    result.children_count = children.length;
+    result.children_preview =
+      children.length > 0
+        ? { first: children[0]?.title ?? null, last: children[children.length - 1]?.title ?? null }
+        : null;
+  } else {
+    // `dateLastUsed` is a real chrome.bookmarks.BookmarkTreeNode field (Chrome 114+, MDN-verified)
+    // missing from the installed @types/chrome@0.0.306 declaration — a types-package gap, not a
+    // runtime one; cast narrowly instead of bumping the whole shared dependency for one field.
+    result.date_last_used = (node as { dateLastUsed?: number }).dateLastUsed ?? null;
+  }
+  return result;
+}
+
+/** One `bookmark.create` batch item — either a new folder or a new leaf bookmark. */
+interface BookmarkCreateItem {
+  readonly type: "folder" | "bookmark";
+  readonly title: string;
+  readonly url?: string;
+  readonly parent_id?: string;
+  readonly parent_ref?: string;
+  readonly ref?: string;
+  readonly index?: number;
+}
+
+/**
+ * Purpose: validate one `bookmark.create` batch item's shape (not its cross-item references).
+ * Args: `value` is one untrusted `items` array element.
+ * Returns: `true` for `{type:"folder"|"bookmark", title, url?, parent_id?, parent_ref?, ref?,
+ * index?}` where `url` is REQUIRED for `type:"bookmark"` and FORBIDDEN for `type:"folder"`, and
+ * `parent_id`/`parent_ref` are mutually exclusive.
+ * Examples: `isBookmarkCreateItem({type:"folder",title:"X"})` is `true`;
+ * `isBookmarkCreateItem({type:"bookmark",title:"X"})` is `false` (bookmark needs a `url`);
+ * `isBookmarkCreateItem({type:"folder",title:"X",url:"https://x"})` is `false` (folders have no url).
+ */
+function isBookmarkCreateItem(value: unknown): value is BookmarkCreateItem {
+  if (!isPlainRecord(value)) return false;
+  if (value.type !== "folder" && value.type !== "bookmark") return false;
+  if (typeof value.title !== "string" || value.title.length === 0) return false;
+  if (value.type === "bookmark" && (typeof value.url !== "string" || value.url.length === 0)) return false;
+  if (value.type === "folder" && value.url !== undefined) return false;
+  if (value.parent_id !== undefined && typeof value.parent_id !== "string") return false;
+  if (value.parent_ref !== undefined && typeof value.parent_ref !== "string") return false;
+  if (value.parent_id !== undefined && value.parent_ref !== undefined) return false;
+  if (value.ref !== undefined && typeof value.ref !== "string") return false;
+  return value.index === undefined || typeof value.index === "number";
+}
+
+/**
+ * Purpose: validate the full `bookmark.create` batch payload.
+ * Args: `value` is the untrusted request payload.
+ * Returns: `true` for `{items: BookmarkCreateItem[]}`, non-empty, every item individually valid.
+ * Examples: `isBookmarkCreatePayload({items:[{type:"bookmark",title:"X",url:"https://x"}]})` is
+ * `true`; `isBookmarkCreatePayload({items:[]})` is `false`.
+ */
+function isBookmarkCreatePayload(value: unknown): value is { items: BookmarkCreateItem[] } {
+  return (
+    isPlainRecord(value) &&
+    Array.isArray(value.items) &&
+    value.items.length > 0 &&
+    value.items.every(isBookmarkCreateItem)
+  );
+}
+
+/**
+ * Purpose: create one or MORE real bookmarks/folders, batch, in ONE call, with absolute placement
+ * finesse — including brand-new folders referenced by later items in the SAME call (KπX, GRAVÉ:
+ * "créer ce bookmark dans tel sous dossier, tel autre dans tel autre sous dossier... en batch").
+ * Args: `payload` must satisfy `isBookmarkCreatePayload`. Items are processed strictly in array
+ * order. Each item's optional `ref` (a caller-chosen LOCAL name, never a real chrome id) may be
+ * targeted by a LATER item's `parent_ref` — resolved against the REAL id chrome.bookmarks.create
+ * just returned for that earlier item, so a folder created earlier in this exact batch can be
+ * filled immediately, with zero extra round trip. `parent_id` targets an already-existing real
+ * folder instead; the two are mutually exclusive per item. Neither given falls back to
+ * `chrome.bookmarks.create`'s own default parent (Other Bookmarks).
+ * Returns: `{created: [{ref, id, type, title, url, parent_id, index}, ...]}`, one entry per input
+ * item, in the same order, `ref` echoed back (`null` when the item declared none).
+ * Raises: a duplicate `ref` anywhere in the batch is rejected BEFORE any creation happens (a fully
+ * static check); an unresolvable `parent_ref` (unknown, or pointing to a LATER item — forward
+ * references are not supported, only earlier ones) is rejected the moment that item is reached —
+ * not atomic: earlier items already created in this call are NOT rolled back (documented, same
+ * rationale as `window-create`'s own `layout`).
+ * Examples: `handleBookmarkCreate({items:[{type:"folder",title:"2026",ref:"y26"},{type:"bookmark",
+ * title:"SynapseS",url:"https://synapses.polytechnique.fr/",parent_ref:"y26"}]})` creates a new
+ * folder then a bookmark placed directly inside it, in one call; `handleBookmarkCreate({items:[
+ * {type:"bookmark",title:"Docs",url:"https://docs.python.org/3/",parent_id:"1"}]})` creates one
+ * bookmark inside an already-existing real folder id `"1"`.
  */
 export async function handleBookmarkCreate(payload: unknown): Promise<Record<string, unknown>> {
-  if (!isBookmarkCreatePayload(payload)) throw new Error("bookmark.create requires {title: string, url: string, parentId?: string}");
-  const node = await chrome.bookmarks.create({ title: payload.title, url: payload.url, parentId: payload.parentId });
-  return { id: node.id, title: node.title, url: node.url ?? null, parentId: node.parentId ?? null };
+  if (!isBookmarkCreatePayload(payload)) {
+    throw new Error(
+      "bookmark.create requires {items: [{type:'folder'|'bookmark', title, url? (bookmark only), parent_id?, parent_ref?, ref?, index?}, ...]}",
+    );
+  }
+  const declaredRefs = payload.items.map((item) => item.ref).filter((ref): ref is string => ref !== undefined);
+  if (new Set(declaredRefs).size !== declaredRefs.length) {
+    throw new Error("bookmark.create: every item's ref must be unique within the same batch");
+  }
+  const refToId = new Map<string, string>();
+  const created: Array<Record<string, unknown>> = [];
+  for (const [index, item] of payload.items.entries()) {
+    let parentId = item.parent_id;
+    if (item.parent_ref !== undefined) {
+      const resolved = refToId.get(item.parent_ref);
+      if (resolved === undefined) {
+        throw new Error(
+          `bookmark.create items[${index}].parent_ref "${item.parent_ref}" does not match an earlier folder item's ref in this same batch`,
+        );
+      }
+      parentId = resolved;
+    }
+    const node = await chrome.bookmarks.create({
+      title: item.title,
+      url: item.type === "bookmark" ? item.url : undefined,
+      parentId,
+      index: item.index,
+    });
+    if (item.ref !== undefined) refToId.set(item.ref, node.id);
+    created.push({
+      ref: item.ref ?? null,
+      id: node.id,
+      type: item.type,
+      title: node.title,
+      url: node.url ?? null,
+      parent_id: node.parentId ?? null,
+      index: node.index ?? null,
+    });
+  }
+  return { created };
 }
 
 /**
- * Purpose: remove a real bookmark from the Edge profile via `chrome.bookmarks.remove`.
- * Args: `payload` must be `{id: string}`.
- * Returns: `{id, removed: true}`.
- * Examples: `handleBookmarkRemove({id:"42"})`; a non-existent id rejects with the underlying `chrome.runtime.lastError` message.
+ * Purpose: permanently remove one or MORE real bookmarks/folders, batch, in ONE call — a target
+ * that is a folder removes it AND everything inside it (subfolders and items alike); a target that
+ * is a leaf bookmark removes only that one entry. Mixing both kinds in the same call is deliberate
+ * (KπX, GRAVÉ: "on peut supprimer de dossier sous dossier juste et élément").
+ * Args: `payload` must be `{ids: string[]}`, non-empty.
+ * Returns: `{removed: [{id, type, title, url}, ...]}` — the REAL identity of every removed node,
+ * confirmed, never a bare id echoed back blind.
+ * Raises: every id is resolved (`chrome.bookmarks.get`) BEFORE any removal happens — an unknown id
+ * anywhere in the batch rejects the WHOLE call and nothing is deleted (all-or-nothing identity,
+ * same rationale as `window-saved-remove`'s locked, explicit-name-only batch delete).
+ * Examples: `handleBookmarkRemove({ids:["42"]})` removes one bookmark leaf;
+ * `handleBookmarkRemove({ids:["7","42"]})` removes folder `"7"` (with its whole subtree) AND leaf
+ * bookmark `"42"`, in the SAME call.
  */
 export async function handleBookmarkRemove(payload: unknown): Promise<Record<string, unknown>> {
-  if (!isPlainRecord(payload) || typeof payload.id !== "string") throw new Error("bookmark.remove requires {id: string}");
-  await chrome.bookmarks.remove(payload.id);
-  return { id: payload.id, removed: true };
+  if (
+    !isPlainRecord(payload) ||
+    !Array.isArray(payload.ids) ||
+    payload.ids.length === 0 ||
+    !payload.ids.every((id): id is string => typeof id === "string")
+  ) {
+    throw new Error("bookmark.remove requires {ids: string[]} (non-empty)");
+  }
+  const ids = payload.ids as string[];
+  const resolved: Array<{ id: string; type: "folder" | "bookmark"; title: string; url: string | null }> = [];
+  for (const id of ids) {
+    const [node] = await chrome.bookmarks.get(id);
+    if (!node) throw new Error(`bookmark.remove: id "${id}" does not exist`);
+    resolved.push({ id, type: node.url === undefined ? "folder" : "bookmark", title: node.title, url: node.url ?? null });
+  }
+  for (const node of resolved) {
+    if (node.type === "folder") {
+      await chrome.bookmarks.removeTree(node.id);
+    } else {
+      await chrome.bookmarks.remove(node.id);
+    }
+  }
+  return { removed: resolved };
+}
+
+/** One `bookmark.update` batch item — any subset of rename/re-url/move/reposition for one real id. */
+interface BookmarkUpdateItem {
+  readonly id: string;
+  readonly title?: string;
+  readonly url?: string;
+  readonly parent_id?: string;
+  readonly index?: number;
+}
+
+/**
+ * Purpose: validate one `bookmark.update` batch item's shape.
+ * Args: `value` is one untrusted `items` array element.
+ * Returns: `true` for `{id: string}` plus ANY combination of `title`, `url`, `parent_id`, `index`
+ * — at least one mutating field beyond `id` is required (a no-op item is rejected, same precedent
+ * as `tab-update`'s own no-op rejection).
+ * Examples: `isBookmarkUpdateItem({id:"1",title:"New name"})` is `true`;
+ * `isBookmarkUpdateItem({id:"1"})` is `false` (nothing to change).
+ */
+function isBookmarkUpdateItem(value: unknown): value is BookmarkUpdateItem {
+  if (!isPlainRecord(value) || typeof value.id !== "string") return false;
+  if (value.title !== undefined && typeof value.title !== "string") return false;
+  if (value.url !== undefined && typeof value.url !== "string") return false;
+  if (value.parent_id !== undefined && typeof value.parent_id !== "string") return false;
+  if (value.index !== undefined && typeof value.index !== "number") return false;
+  return value.title !== undefined || value.url !== undefined || value.parent_id !== undefined || value.index !== undefined;
+}
+
+/**
+ * Purpose: validate the full `bookmark.update` batch payload.
+ * Args: `value` is the untrusted request payload.
+ * Returns: `true` for `{items: BookmarkUpdateItem[]}`, non-empty, every item individually valid.
+ * Examples: `isBookmarkUpdatePayload({items:[{id:"1",title:"X"}]})` is `true`;
+ * `isBookmarkUpdatePayload({items:[]})` is `false`.
+ */
+function isBookmarkUpdatePayload(value: unknown): value is { items: BookmarkUpdateItem[] } {
+  return (
+    isPlainRecord(value) &&
+    Array.isArray(value.items) &&
+    value.items.length > 0 &&
+    value.items.every(isBookmarkUpdateItem)
+  );
+}
+
+/**
+ * Purpose: the ONE fine-grained way to change anything about one or MORE existing real bookmarks
+ * or folders — rename, change url, relocate to a different folder, and/or reposition among
+ * siblings — any subset, batch, in ONE call (KπX, GRAVÉ: new action, same "absolute finesse"
+ * philosophy as `tab-update`, extended to bookmarks).
+ * Args: `payload` must satisfy `isBookmarkUpdatePayload`.
+ * Returns: `{updated: [{id, title, url, parent_id, index}, ...]}` — each entry reflecting that
+ * node's REAL state after every requested change, same order as the input items.
+ * Raises: every id is resolved BEFORE any mutation happens — an unknown id, or a `url` given for
+ * an id that is actually a folder, rejects the WHOLE call and nothing is changed (all-or-nothing
+ * identity, same rationale as `bookmark.remove`).
+ * Examples: `handleBookmarkUpdate({items:[{id:"42",title:"Renamed"}]})` renames one bookmark;
+ * `handleBookmarkUpdate({items:[{id:"42",parent_id:"7",index:0}]})` moves bookmark `"42"` to the
+ * front of folder `"7"`; `handleBookmarkUpdate({items:[{id:"1",title:"A"},{id:"2",url:"https://b"}]})`
+ * applies two independent updates in the same call.
+ */
+export async function handleBookmarkUpdate(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isBookmarkUpdatePayload(payload)) {
+    throw new Error(
+      "bookmark.update requires {items: [{id, title?, url?, parent_id?, index?}, ...]} (at least one field beyond id per item)",
+    );
+  }
+  for (const item of payload.items) {
+    const [node] = await chrome.bookmarks.get(item.id);
+    if (!node) throw new Error(`bookmark.update: id "${item.id}" does not exist`);
+    if (node.url === undefined && item.url !== undefined) {
+      throw new Error(`bookmark.update: id "${item.id}" is a folder — url cannot be set on a folder`);
+    }
+  }
+  const updated: Array<Record<string, unknown>> = [];
+  for (const item of payload.items) {
+    if (item.title !== undefined || item.url !== undefined) {
+      await chrome.bookmarks.update(item.id, { title: item.title, url: item.url });
+    }
+    if (item.parent_id !== undefined || item.index !== undefined) {
+      await chrome.bookmarks.move(item.id, { parentId: item.parent_id, index: item.index });
+    }
+    const [node] = await chrome.bookmarks.get(item.id);
+    if (!node) throw new Error(`bookmark.update: id "${item.id}" no longer exists after applying earlier items`);
+    updated.push({ id: item.id, title: node.title, url: node.url ?? null, parent_id: node.parentId ?? null, index: node.index ?? null });
+  }
+  return { updated };
 }
 
 /** One real tab entry inside `computeWindowLayouts()`'s per-window canonical layout. */
@@ -1545,9 +1897,11 @@ export async function handleTabCaptureNext(payload: unknown): Promise<Record<str
 }
 
 export const KIND_HANDLERS: Record<string, KindHandler> = {
-  "bookmark.list": () => handleBookmarkList(),
+  "bookmark.list": (payload) => handleBookmarkList(payload),
+  "bookmark.get": (payload) => handleBookmarkGet(payload),
   "bookmark.create": (payload) => handleBookmarkCreate(payload),
   "bookmark.remove": (payload) => handleBookmarkRemove(payload),
+  "bookmark.update": (payload) => handleBookmarkUpdate(payload),
   "group.list": () => handleGroupList(),
   "group.create": (payload) => handleGroupCreate(payload),
   "group.update": (payload) => handleGroupUpdate(payload),

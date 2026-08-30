@@ -35,15 +35,69 @@ class FakeWebSocket {
  * module registers `chrome.runtime.onMessage.addListener(...)` as a top-level side effect.
  */
 function installChromeMock() {
-  const bookmarksCreate = mock(async (bookmark: { title: string; url: string; parentId?: string }) => ({
+  const bookmarksCreate = mock(async (bookmark: { title: string; url?: string; parentId?: string; index?: number }) => ({
     id: "99",
     title: bookmark.title,
     url: bookmark.url,
     parentId: bookmark.parentId,
+    index: bookmark.index ?? 0,
   }));
   const bookmarksRemove = mock(async (_id: string) => undefined);
-  const bookmarksGetTree = mock(async () => [{ id: "0", title: "root", children: [{ id: "1", title: "Bookmarks Bar", url: undefined, parentId: "0", children: [] }] }]);
-  const bookmarksGet = mock(async (_id: string) => [{ id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com" }]);
+  const bookmarksRemoveTree = mock(async (_id: string) => undefined);
+  const bookmarksMove = mock(async (id: string, props: { parentId?: string; index?: number }) => ({
+    id,
+    parentId: props.parentId ?? "1",
+    index: props.index ?? 0,
+  }));
+  const bookmarksUpdate = mock(async (id: string, props: { title?: string; url?: string }) => ({
+    id,
+    title: props.title ?? "KpihX Labs",
+    url: props.url,
+  }));
+  const bookmarksGetTree = mock(async () => [
+    {
+      id: "0",
+      title: "",
+      children: [
+        {
+          id: "1",
+          title: "Bookmarks bar",
+          parentId: "0",
+          index: 0,
+          children: [
+            { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+          ],
+        },
+        { id: "2", title: "Other bookmarks", parentId: "0", index: 1, children: [] },
+      ],
+    },
+  ]);
+  const bookmarksGet = mock(
+    async (
+      _id: string,
+    ): Promise<Array<{ id: string; title: string; url?: string; parentId?: string; index?: number }>> => [
+      { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+    ],
+  );
+  type MockBookmarkNode = {
+    id: string;
+    title: string;
+    url?: string;
+    parentId?: string;
+    index?: number;
+    children?: MockBookmarkNode[];
+  };
+  const bookmarksGetSubTree = mock(async (_id: string): Promise<MockBookmarkNode[]> => [
+    {
+      id: "1",
+      title: "Bookmarks bar",
+      parentId: "0",
+      index: 0,
+      children: [
+        { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+      ],
+    },
+  ]);
 
   const tabsGroup = mock(async (_options: { tabIds: number | number[] }) => 7);
   const tabGroupsUpdate = mock(async (id: number, props: { title?: string; color?: string; collapsed?: boolean }) => ({
@@ -93,7 +147,16 @@ function installChromeMock() {
   const storageLocalGet = mock(async (_key: string) => ({}) as Record<string, unknown>);
 
   (globalThis as Record<string, unknown>).chrome = {
-    bookmarks: { create: bookmarksCreate, remove: bookmarksRemove, getTree: bookmarksGetTree, get: bookmarksGet },
+    bookmarks: {
+      create: bookmarksCreate,
+      remove: bookmarksRemove,
+      removeTree: bookmarksRemoveTree,
+      move: bookmarksMove,
+      update: bookmarksUpdate,
+      getTree: bookmarksGetTree,
+      getSubTree: bookmarksGetSubTree,
+      get: bookmarksGet,
+    },
     tabGroups: { update: tabGroupsUpdate, query: tabGroupsQuery, move: tabGroupsMove, get: tabGroupsGet },
     tabs: {
       group: tabsGroup,
@@ -136,7 +199,11 @@ function installChromeMock() {
   return {
     bookmarksCreate,
     bookmarksRemove,
+    bookmarksRemoveTree,
+    bookmarksMove,
+    bookmarksUpdate,
     bookmarksGetTree,
+    bookmarksGetSubTree,
     bookmarksGet,
     tabsGroup,
     tabGroupsUpdate,
@@ -185,30 +252,268 @@ beforeAll(async () => {
 });
 
 describe("KIND_HANDLERS dispatch table", () => {
-  test("bookmark.create calls chrome.bookmarks.create with the real payload and returns real data", async () => {
-    const handler = getHandler("bookmark.create");
-    const result = await handler({ title: "KpihX Labs", url: "https://kpihx-labs.com" });
-    expect(mocks.bookmarksCreate).toHaveBeenCalledWith({ title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: undefined });
-    expect(result).toEqual({ id: "99", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: null });
-  });
-
-  test("bookmark.create rejects a malformed payload instead of silently stubbing a response", async () => {
-    const handler = getHandler("bookmark.create");
-    await expect(handler({ title: "missing url" })).rejects.toThrow();
-  });
-
-  test("bookmark.remove calls chrome.bookmarks.remove and returns real data", async () => {
-    const handler = getHandler("bookmark.remove");
-    const result = await handler({ id: "42" });
-    expect(mocks.bookmarksRemove).toHaveBeenCalledWith("42");
-    expect(result).toEqual({ id: "42", removed: true });
-  });
-
-  test("bookmark.list flattens the real chrome.bookmarks.getTree() result (not a hardcoded stub)", async () => {
+  test("bookmark.list reveals the REAL nested folder/subfolder tree, never a flat dump", async () => {
     const handler = getHandler("bookmark.list");
-    const result = (await handler(undefined)) as { bookmarks: unknown[] };
+    const result = (await handler({})) as { depth: number | null; roots: Array<Record<string, unknown>> };
     expect(mocks.bookmarksGetTree).toHaveBeenCalled();
-    expect(result.bookmarks.length).toBeGreaterThan(0);
+    expect(result.depth).toBeNull();
+    // The invisible super-root ("0") is never itself returned — roots starts at its real children.
+    expect(result.roots.map((root) => root.id)).toEqual(["1", "2"]);
+    const bar = result.roots[0] as { type: string; children: Array<Record<string, unknown>> };
+    expect(bar.type).toBe("folder");
+    expect(bar.children).toEqual([
+      { id: "42", title: "KpihX Labs", type: "bookmark", url: "https://kpihx-labs.com", parent_id: "1", index: 0 },
+    ]);
+  });
+
+  test("bookmark.list depth:0 returns only the top-level roots, with empty children, never descending", async () => {
+    const handler = getHandler("bookmark.list");
+    const result = (await handler({ depth: 0 })) as { depth: number | null; roots: Array<{ children: unknown[] }> };
+    expect(result.depth).toBe(0);
+    expect(result.roots.every((root) => Array.isArray(root.children) && root.children.length === 0)).toBe(true);
+  });
+
+  test("bookmark.list rejects a negative or non-integer depth", async () => {
+    const handler = getHandler("bookmark.list");
+    await expect(handler({ depth: -1 })).rejects.toThrow();
+    await expect(handler({ depth: 1.5 })).rejects.toThrow();
+  });
+
+  test("bookmark.list root_id scopes the whole call to ONE subfolder via getSubTree, never the top-level roots", async () => {
+    const handler = getHandler("bookmark.list");
+    mocks.bookmarksGetTree.mockClear();
+    const result = (await handler({ root_id: "1" })) as { depth: number | null; roots: Array<Record<string, unknown>> };
+    expect(mocks.bookmarksGetSubTree).toHaveBeenCalledWith("1");
+    expect(mocks.bookmarksGetTree).not.toHaveBeenCalled();
+    expect(result.roots).toEqual([
+      {
+        id: "1",
+        title: "Bookmarks bar",
+        type: "folder",
+        url: null,
+        parent_id: "0",
+        index: 0,
+        children: [
+          { id: "42", title: "KpihX Labs", type: "bookmark", url: "https://kpihx-labs.com", parent_id: "1", index: 0 },
+        ],
+      },
+    ]);
+  });
+
+  test("bookmark.list rejects a root_id naming a bookmark leaf, not a folder", async () => {
+    const handler = getHandler("bookmark.list");
+    mocks.bookmarksGetSubTree.mockImplementationOnce(async () => [
+      { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+    ]);
+    await expect(handler({ root_id: "42" })).rejects.toThrow(/leaf/);
+  });
+
+  test("bookmark.list rejects an unknown root_id", async () => {
+    const handler = getHandler("bookmark.list");
+    mocks.bookmarksGetSubTree.mockImplementationOnce(async () => [] as never[]);
+    await expect(handler({ root_id: "does-not-exist" })).rejects.toThrow();
+  });
+
+  test("bookmark.get reads ALL available info about ONE folder, including a children preview never the full subtree", async () => {
+    const handler = getHandler("bookmark.get");
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      { id: "29", title: "X", parentId: "2", index: 14, dateAdded: 1000, dateGroupModified: 2000 },
+    ]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "2", title: "Other favorites" }]);
+    mocks.bookmarksGetSubTree.mockImplementationOnce(async () => [
+      {
+        id: "29",
+        title: "X",
+        parentId: "2",
+        index: 14,
+        children: [
+          { id: "30", title: "First link", url: "https://a", parentId: "29", index: 0 },
+          { id: "31", title: "Last link", url: "https://b", parentId: "29", index: 1 },
+        ],
+      },
+    ]);
+    const result = await handler({ id: "29" });
+    expect(result).toEqual({
+      id: "29",
+      title: "X",
+      type: "folder",
+      url: null,
+      parent_id: "2",
+      parent_title: "Other favorites",
+      index: 14,
+      date_added: 1000,
+      date_group_modified: 2000,
+      children_count: 2,
+      children_preview: { first: "First link", last: "Last link" },
+    });
+  });
+
+  test("bookmark.get reads ALL available info about ONE leaf bookmark — date_last_used, never children_*", async () => {
+    const handler = getHandler("bookmark.get");
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      {
+        id: "42",
+        title: "KpihX Labs",
+        url: "https://kpihx-labs.com",
+        parentId: "1",
+        index: 0,
+        dateAdded: 1000,
+        dateLastUsed: 3000,
+      },
+    ]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "1", title: "Bookmarks bar" }]);
+    const result = (await handler({ id: "42" })) as Record<string, unknown>;
+    expect(result.type).toBe("bookmark");
+    expect(result.date_last_used).toBe(3000);
+    expect(result).not.toHaveProperty("children_count");
+    expect(result).not.toHaveProperty("date_group_modified");
+  });
+
+  test("bookmark.get on an empty folder returns children_count:0 and a null preview", async () => {
+    const handler = getHandler("bookmark.get");
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "7", title: "Empty", parentId: "5", index: 0 }]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "5", title: "Workspaces" }]);
+    mocks.bookmarksGetSubTree.mockImplementationOnce(async () => [{ id: "7", title: "Empty", parentId: "5", index: 0, children: [] }]);
+    const result = (await handler({ id: "7" })) as Record<string, unknown>;
+    expect(result.children_count).toBe(0);
+    expect(result.children_preview).toBeNull();
+  });
+
+  test("bookmark.get rejects a malformed payload and an unknown id", async () => {
+    const handler = getHandler("bookmark.get");
+    await expect(handler({})).rejects.toThrow();
+    mocks.bookmarksGet.mockImplementationOnce(async () => [] as never[]);
+    await expect(handler({ id: "does-not-exist" })).rejects.toThrow();
+  });
+
+  test("bookmark.create places a batch of items with absolute finesse — a folder created earlier in the SAME call resolved via parent_ref, no extra round trip", async () => {
+    const handler = getHandler("bookmark.create");
+    mocks.bookmarksCreate.mockClear();
+    mocks.bookmarksCreate.mockImplementationOnce(async (bookmark) => ({
+      id: "101",
+      title: bookmark.title,
+      url: bookmark.url,
+      parentId: bookmark.parentId,
+      index: 0,
+    }));
+    mocks.bookmarksCreate.mockImplementationOnce(async (bookmark) => ({
+      id: "102",
+      title: bookmark.title,
+      url: bookmark.url,
+      parentId: bookmark.parentId,
+      index: 0,
+    }));
+    const result = await handler({
+      items: [
+        { type: "folder", title: "2026", ref: "y26", parent_id: "1" },
+        { type: "bookmark", title: "SynapseS", url: "https://synapses.polytechnique.fr/", parent_ref: "y26" },
+      ],
+    });
+    expect(mocks.bookmarksCreate).toHaveBeenNthCalledWith(1, { title: "2026", url: undefined, parentId: "1", index: undefined });
+    expect(mocks.bookmarksCreate).toHaveBeenNthCalledWith(2, {
+      title: "SynapseS",
+      url: "https://synapses.polytechnique.fr/",
+      parentId: "101",
+      index: undefined,
+    });
+    expect(result).toEqual({
+      created: [
+        { ref: "y26", id: "101", type: "folder", title: "2026", url: null, parent_id: "1", index: 0 },
+        { ref: null, id: "102", type: "bookmark", title: "SynapseS", url: "https://synapses.polytechnique.fr/", parent_id: "101", index: 0 },
+      ],
+    });
+  });
+
+  test("bookmark.create rejects a duplicate ref BEFORE creating anything", async () => {
+    const handler = getHandler("bookmark.create");
+    mocks.bookmarksCreate.mockClear();
+    await expect(
+      handler({
+        items: [
+          { type: "folder", title: "A", ref: "dup" },
+          { type: "folder", title: "B", ref: "dup" },
+        ],
+      }),
+    ).rejects.toThrow(/unique/);
+    expect(mocks.bookmarksCreate).not.toHaveBeenCalled();
+  });
+
+  test("bookmark.create rejects a parent_ref that does not match an earlier item", async () => {
+    const handler = getHandler("bookmark.create");
+    await expect(
+      handler({ items: [{ type: "bookmark", title: "X", url: "https://x", parent_ref: "nonexistent" }] }),
+    ).rejects.toThrow(/parent_ref/);
+  });
+
+  test("bookmark.create rejects a malformed item instead of silently stubbing a response", async () => {
+    const handler = getHandler("bookmark.create");
+    await expect(handler({ items: [{ type: "bookmark", title: "missing url" }] })).rejects.toThrow();
+    await expect(handler({ items: [{ type: "folder", title: "X", url: "https://x" }] })).rejects.toThrow();
+  });
+
+  test("bookmark.remove deletes a mix of a whole folder (removeTree) AND a standalone leaf (remove) in ONE batch call", async () => {
+    const handler = getHandler("bookmark.remove");
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "7", title: "Old project", parentId: "1", index: 0 }]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 1 },
+    ]);
+    const result = await handler({ ids: ["7", "42"] });
+    expect(mocks.bookmarksRemoveTree).toHaveBeenCalledWith("7");
+    expect(mocks.bookmarksRemove).toHaveBeenCalledWith("42");
+    expect(result).toEqual({
+      removed: [
+        { id: "7", type: "folder", title: "Old project", url: null },
+        { id: "42", type: "bookmark", title: "KpihX Labs", url: "https://kpihx-labs.com" },
+      ],
+    });
+  });
+
+  test("bookmark.remove is all-or-nothing — an unknown id anywhere in the batch removes NOTHING", async () => {
+    const handler = getHandler("bookmark.remove");
+    mocks.bookmarksRemove.mockClear();
+    mocks.bookmarksRemoveTree.mockClear();
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+    ]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [] as never[]);
+    await expect(handler({ ids: ["42", "does-not-exist"] })).rejects.toThrow();
+    expect(mocks.bookmarksRemove).not.toHaveBeenCalled();
+    expect(mocks.bookmarksRemoveTree).not.toHaveBeenCalled();
+  });
+
+  test("bookmark.remove rejects a malformed payload", async () => {
+    const handler = getHandler("bookmark.remove");
+    await expect(handler({ ids: [] })).rejects.toThrow();
+    await expect(handler({ id: "42" })).rejects.toThrow();
+  });
+
+  test("bookmark.update applies any subset of rename/re-url/move/reposition, batch, in one call", async () => {
+    const handler = getHandler("bookmark.update");
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+    ]);
+    mocks.bookmarksGet.mockImplementationOnce(async () => [
+      { id: "42", title: "KpihX Labs (new)", url: "https://kpihx-labs.com", parentId: "7", index: 0 },
+    ]);
+    const result = await handler({ items: [{ id: "42", title: "KpihX Labs (new)", parent_id: "7" }] });
+    expect(mocks.bookmarksUpdate).toHaveBeenCalledWith("42", { title: "KpihX Labs (new)", url: undefined });
+    expect(mocks.bookmarksMove).toHaveBeenCalledWith("42", { parentId: "7", index: undefined });
+    expect(result).toEqual({
+      updated: [{ id: "42", title: "KpihX Labs (new)", url: "https://kpihx-labs.com", parent_id: "7", index: 0 }],
+    });
+  });
+
+  test("bookmark.update rejects setting a url on an id that is actually a folder, before mutating anything", async () => {
+    const handler = getHandler("bookmark.update");
+    mocks.bookmarksUpdate.mockClear();
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "7", title: "Folder", parentId: "1", index: 0 }]);
+    await expect(handler({ items: [{ id: "7", url: "https://x" }] })).rejects.toThrow(/folder/);
+    expect(mocks.bookmarksUpdate).not.toHaveBeenCalled();
+  });
+
+  test("bookmark.update rejects a no-op item (nothing to change beyond id)", async () => {
+    const handler = getHandler("bookmark.update");
+    await expect(handler({ items: [{ id: "42" }] })).rejects.toThrow();
   });
 
   test("group.create calls chrome.tabs.group then chrome.tabGroups.update with the right args", async () => {
@@ -488,18 +793,39 @@ describe("KIND_HANDLERS dispatch table", () => {
     expect(message.details).toEqual(['name: "session"', "value: <redacted>", 'domain: "example.com"']);
   });
 
-  test("the approval overlay illustrates a bookmark-remove's real title/url, never a bare bookmark id", async () => {
+  test("the approval overlay illustrates a batch bookmark-remove's real title/url per id, never a bare bookmark id", async () => {
     mocks.tabsSendMessage.mockClear();
     mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com" }]);
     await background.handleRequest({
       type: "request",
       id: "req-approval-transparency-4",
       kind: "approval",
-      payload: { action: "bookmark-remove", payload: { profile: "default", id: "42" } },
+      payload: { action: "bookmark-remove", payload: { profile: "default", ids: ["42"] } },
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
     const [, message] = mocks.tabsSendMessage.mock.calls[0] as [number, { details: string[] }];
-    expect(message.details).toEqual(['id: "42"', "", 'bookmark 42: "KpihX Labs" (https://kpihx-labs.com)']);
+    expect(message.details).toEqual(["ids:", "  42", "", 'bookmark 42: "KpihX Labs" (https://kpihx-labs.com)']);
+  });
+
+  test("the approval overlay illustrates a batch bookmark-create's referenced EXISTING parent folder, never a bare parent_id", async () => {
+    mocks.tabsSendMessage.mockClear();
+    mocks.bookmarksGet.mockImplementationOnce(async () => [{ id: "1", title: "Bookmarks bar" }]);
+    await background.handleRequest({
+      type: "request",
+      id: "req-approval-transparency-5",
+      kind: "approval",
+      payload: {
+        action: "bookmark-create",
+        payload: { profile: "default", items: [{ type: "bookmark", title: "X", url: "https://x", parent_id: "1" }] },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const [, message] = mocks.tabsSendMessage.mock.calls[0] as [number, { details: string[] }];
+    expect(message.details).toEqual([
+      `items: ${JSON.stringify([{ type: "bookmark", title: "X", url: "https://x", parent_id: "1" }])}`,
+      "",
+      'bookmark 1: "Bookmarks bar" ()',
+    ]);
   });
 
   test("requestApproval redirects (focuses) the tab AND its window that will host the overlay — never a prompt KπX has to discover by accident", async () => {
