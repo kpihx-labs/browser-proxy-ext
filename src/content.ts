@@ -75,7 +75,8 @@ function showApprovalOverlay(prompt: ShowApprovalMessage): void {
   const host = document.createElement("div");
   host.id = "browser-proxy-approval";
   const root = host.attachShadow({ mode: "closed" });
-  root.innerHTML = `<style>${OVERLAY_STYLE}</style><section role="dialog" aria-modal="true" aria-label="Browser Proxy approval"><strong>Approve browser action?</strong><p>The local browser-proxyd requests: ${prompt.scopes.map(escapeHtml).join(", ")}.</p><p>No page content, credentials, or secret will be shared.</p><button id="approve" type="button">Approve once</button><button id="deny" type="button">Deny</button></section>`;
+  const detailsHtml = prompt.details.length > 0 ? `<ul class="details">${prompt.details.map((detail) => `<li>${escapeHtml(detail)}</li>`).join("")}</ul>` : "";
+  root.innerHTML = `<style>${OVERLAY_STYLE}</style><section role="dialog" aria-modal="true" aria-label="Browser Proxy approval"><strong>Approve browser action?</strong><p>The local browser-proxyd requests: ${prompt.scopes.map(escapeHtml).join(", ")}.</p>${detailsHtml}<p>No page content, credentials, or secret will be shared.</p><button id="approve" type="button">Approve once</button><button id="deny" type="button">Deny</button></section>`;
   root.getElementById("approve")?.addEventListener("click", () => respondApproval(prompt.requestId, true, host));
   root.getElementById("deny")?.addEventListener("click", () => respondApproval(prompt.requestId, false, host));
   document.documentElement.append(host);
@@ -263,6 +264,6 @@ function escapeHtml(value: string): string {
 }
 
 const OVERLAY_STYLE =
-  ":host{all:initial}section{position:fixed;right:24px;bottom:24px;z-index:2147483647;max-width:360px;padding:18px;background:#111827;color:#f9fafb;border:1px solid #60a5fa;border-radius:10px;font:14px system-ui;box-shadow:0 8px 28px #0008}button{margin:10px 8px 0 0;padding:7px 12px;border-radius:6px;border:0;font:inherit;cursor:pointer}#approve,#submit{background:#2563eb;color:white}#deny{background:#374151;color:white}";
+  ":host{all:initial}section{position:fixed;right:24px;bottom:24px;z-index:2147483647;max-width:360px;padding:18px;background:#111827;color:#f9fafb;border:1px solid #60a5fa;border-radius:10px;font:14px system-ui;box-shadow:0 8px 28px #0008}button{margin:10px 8px 0 0;padding:7px 12px;border-radius:6px;border:0;font:inherit;cursor:pointer}#approve,#submit{background:#2563eb;color:white}#deny{background:#374151;color:white}ul.details{margin:8px 0;padding:8px 10px;background:#1f2937;border-radius:6px;list-style:none;font:12px/1.5 ui-monospace,monospace;max-height:160px;overflow:auto}ul.details li{word-break:break-all}";
 
 chrome.runtime.onMessage.addListener(onBackgroundMessage);

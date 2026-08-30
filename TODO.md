@@ -4,7 +4,9 @@
 
 - [ ] Add signed-release packaging and reproducible artifact verification.
 - [ ] Add integration tests against the browser-proxyd handshake fixture.
-- [ ] Add an accessibility review for the approval overlay.
+- [ ] Add an accessibility review for the approval overlay (now also renders a `details` field
+  list — real proposal fields — inside the closed-shadow-root dialog; screen-reader labeling for
+  that list is not yet reviewed).
 - [ ] Add configurable, allowlisted local endpoint selection with strict loopback validation.
 
 ## Honest scope gaps (documented, not faked)

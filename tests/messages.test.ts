@@ -24,9 +24,15 @@ import {
 // background.ts now builds the exact same shape content.ts validates (requestId/scopes), instead
 // of the old id/kind shape that isApprovalPrompt() always rejected.
 test("showApproval round trip: background's builder output is accepted by content's validator", () => {
-  const messageBackgroundWouldSend = buildShowApprovalMessage("r-1", ["bookmark.create"]);
-  expect(messageBackgroundWouldSend).toEqual({ type: "showApproval", requestId: "r-1", scopes: ["bookmark.create"] });
+  const messageBackgroundWouldSend = buildShowApprovalMessage("r-1", ["bookmark.create"], ["title: \"Research\""]);
+  expect(messageBackgroundWouldSend).toEqual({ type: "showApproval", requestId: "r-1", scopes: ["bookmark.create"], details: ["title: \"Research\""] });
   expect(isShowApprovalMessage(messageBackgroundWouldSend)).toBe(true);
+});
+
+test("showApproval defaults to an empty details array when omitted (100% transparency is additive, never a hard requirement that breaks a bare call)", () => {
+  const message = buildShowApprovalMessage("r-1", ["bookmark.create"]);
+  expect(message.details).toEqual([]);
+  expect(isShowApprovalMessage(message)).toBe(true);
 });
 
 test("showApproval validator rejects the old, mismatched id/kind shape", () => {

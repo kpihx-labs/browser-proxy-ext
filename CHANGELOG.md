@@ -4,6 +4,30 @@ All notable changes are documented here.
 
 ## 0.2.0 — 2026-08-29
 
+- **Fixed approval overlays silently failing whenever the active tab is this extension's OWN
+  Options page (or any `edge://` page)**: root-caused live — 4 consecutive `group-create` approval
+  requests were rejected instantly with zero human interaction while the "Browser Proxy Bridge
+  settings" tab happened to be active; `getActiveTabId()` only ever looked at the active tab of the
+  last-focused window, and `chrome.tabs.sendMessage` to an extension page or `edge://` page silently
+  fails (manifest `content_scripts.matches` never targets either), which `requestApproval()`
+  reported as a generic "Failed to show approval UI" — the daemon side then surfaced this
+  indistinguishably from a genuine human "Deny." New `isApprovableUrl()` gate: `getActiveTabId()`
+  now falls back to the first `http(s)` tab in the same window whenever the active tab cannot host
+  the overlay. As a further, KπX-requested last resort — when NO `http(s)` tab exists anywhere in
+  the window at all — `requestApproval()` now creates a real temporary tab
+  (`createTemporaryApprovalTab()`, `https://example.com/`, never focused) purely to host the
+  overlay, and always closes it again the instant the approval settles: on an explicit decision
+  (`handleApprovalResponse`) or, new, on a timeout with no answer at all (`expireApprovalIfStillPending`,
+  a `setTimeout` now scheduled per pending approval — previously nothing ever proactively expired a
+  request that never received a reply). **Second root cause found live in the same investigation**:
+  a found candidate tab (active or fallback) can still fail delivery for an unrelated reason — most
+  concretely, right after THIS extension itself reloads, every PREVIOUSLY-open tab's content script
+  is orphaned (a fresh background service worker cannot message a stale one), so
+  `chrome.tabs.sendMessage` silently fails even to an otherwise perfectly normal, currently-open
+  `http(s)` tab. `requestApproval()` now ALWAYS retries once via a brand-new temporary tab whenever
+  the first delivery attempt fails for any reason, not only when no candidate existed at all. 4 new
+  regression tests (temporary-tab creation, retry-after-stale-content-script, cleanup on approval,
+  cleanup on timeout).
 - **Fixed the extension never declaring which profile it belongs to** (paired daemon-side fix:
   3 profiles used to return the byte-identical bookmark tree because the daemon had only one global
   connection slot and this extension gave it nothing to key on). Options page (`options.html`) gained

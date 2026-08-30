@@ -9,11 +9,16 @@
 /** Redacted category labels shown to the user for a daemon-issued approval request. */
 export type ApprovalScope = string;
 
-/** Background -> content: show a redacted approve/deny prompt before a daemon action executes. */
+/** Background -> content: show a redacted approve/deny prompt before a daemon action executes.
+ * `details` are the real, human-readable, non-secret proposal fields (e.g. `tab_ids: [1,2]`,
+ * `title: "Research"`) — 100% transparency of WHAT is being proposed (KπX directive: the overlay
+ * must show exactly what is proposed, not just a bare action name); only genuinely secret fields
+ * (passwords, cookie values, file contents) are ever redacted out of `details`. */
 export interface ShowApprovalMessage {
   readonly type: "showApproval";
   readonly requestId: string;
   readonly scopes: readonly ApprovalScope[];
+  readonly details: readonly string[];
 }
 
 /** Content -> background: the user's approve/deny decision for one `ShowApprovalMessage`. */
@@ -178,8 +183,8 @@ function isReplyShape<T extends string>(value: unknown, type: T, extra: (record:
  * Returns: a `ShowApprovalMessage` ready for `chrome.tabs.sendMessage`.
  * Examples: `buildShowApprovalMessage("r-1", ["bookmark.create"])`; `buildShowApprovalMessage("r-2", ["group.move"])`.
  */
-export function buildShowApprovalMessage(requestId: string, scopes: readonly string[]): ShowApprovalMessage {
-  return { type: "showApproval", requestId, scopes };
+export function buildShowApprovalMessage(requestId: string, scopes: readonly string[], details: readonly string[] = []): ShowApprovalMessage {
+  return { type: "showApproval", requestId, scopes, details };
 }
 
 /**
@@ -190,7 +195,9 @@ export function buildShowApprovalMessage(requestId: string, scopes: readonly str
  */
 export function isShowApprovalMessage(value: unknown): value is ShowApprovalMessage {
   if (!isPlainRecord(value)) return false;
-  return value.type === "showApproval" && isRequestId(value.requestId) && Array.isArray(value.scopes) && value.scopes.length > 0 && value.scopes.every((scope) => typeof scope === "string");
+  if (value.type !== "showApproval" || !isRequestId(value.requestId)) return false;
+  if (!Array.isArray(value.scopes) || value.scopes.length === 0 || !value.scopes.every((scope) => typeof scope === "string")) return false;
+  return Array.isArray(value.details) && value.details.every((detail) => typeof detail === "string");
 }
 
 /**
