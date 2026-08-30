@@ -19,9 +19,16 @@ export interface RequestMessage {
 /** A structurally valid server message before state-machine validation. */
 export type ServerMessage = HandshakeAcceptedMessage | RequestMessage;
 
-/** A client protocol message. */
+/** A client protocol message. `profile` is the operator-declared browser-proxy profile this
+ * extension install belongs to (its own `--user-data-dir`) — the daemon routes every subsequent
+ * request for that profile exclusively to this connection, never to a different profile's. */
 export type ClientMessage =
-  | { readonly type: "handshake"; readonly token: string; readonly extension_id: string }
+  | {
+      readonly type: "handshake";
+      readonly token: string;
+      readonly extension_id: string;
+      readonly profile: string;
+    }
   | { readonly type: "response"; readonly id: string; readonly ok: boolean; readonly data: unknown };
 
 /**

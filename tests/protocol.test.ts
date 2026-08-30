@@ -21,8 +21,8 @@ test("parseServerMessage accepts valid frames", () => {
 
 test("serializeClientMessage formats correctly", () => {
   expect(
-    serializeClientMessage({ type: "handshake", token: "secret", extension_id: "ext1" })
-  ).toEqual('{"type":"handshake","token":"secret","extension_id":"ext1"}');
+    serializeClientMessage({ type: "handshake", token: "secret", extension_id: "ext1", profile: "default" })
+  ).toEqual('{"type":"handshake","token":"secret","extension_id":"ext1","profile":"default"}');
   expect(serializeClientMessage({ type: "response", id: "r-1", ok: false, data: {} })).toEqual(
     '{"type":"response","id":"r-1","ok":false,"data":{}}'
   );

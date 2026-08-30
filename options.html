@@ -4,8 +4,17 @@
   <body>
     <main>
       <h1>Browser Proxy Bridge</h1>
-      <p>Enter the shared secret provisioned by your local browser-proxyd instance.</p>
+      <p>1. Generate a pairing secret here. 2. Copy it into the hidden prompt from <code>browser-proxy admin extension pair</code>. 3. Set the browser-proxy profile name this install belongs to. 4. Click Save below.</p>
       <label>Shared secret <input id="secret" type="password" autocomplete="new-password"></label>
+      <button id="generate" type="button">Generate pairing secret</button>
+      <section id="generated-secret-panel" hidden>
+        <p>Copy this secret now. It is shown only until you click Hide or Save.</p>
+        <label>New pairing secret <input id="generated-secret" type="text" readonly></label>
+        <button id="copy" type="button">Copy pairing secret</button>
+        <button id="hide" type="button">Hide secret</button>
+      </section>
+      <label>Browser-proxy profile <input id="profile" type="text" placeholder="default" autocomplete="off"></label>
+      <p>Must exactly match the <code>--profile</code> name used with <code>browser-proxy admin edge start</code>/<code>profile-start</code> for THIS Edge window. Each profile is a separate, isolated Edge install with its own copy of this extension — set this once per profile, never shared.</p>
       <button id="save" type="button">Save</button>
       <p id="status" role="status"></p>
     </main>

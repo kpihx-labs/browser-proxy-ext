@@ -1,70 +1,268 @@
-/** A redacted request payload accepted from the extension background worker. */
-interface ApprovalPrompt {
-  readonly type: "showApproval";
-  readonly requestId: string;
-  readonly scopes: readonly string[];
-}
+import {
+  buildAskResponseMessage,
+  buildApprovalResponseMessage,
+  buildDismissOverlaysResponseMessage,
+  buildDropFileResponseMessage,
+  buildSetComboboxResponseMessage,
+  buildSetDateResponseMessage,
+  buildSolveCaptchaResponseMessage,
+  isDismissOverlaysMessage,
+  isDropFileMessage,
+  isSetComboboxMessage,
+  isSetDateMessage,
+  isShowApprovalMessage,
+  isShowAskMessage,
+  isSolveCaptchaMessage,
+  type DropFileMessage,
+  type SetComboboxMessage,
+  type SetDateMessage,
+  type ShowApprovalMessage,
+  type ShowAskMessage,
+  type SolveCaptchaMessage,
+} from "./messages";
 
 /**
- * Purpose: receive a redacted approval prompt and render it in a closed shadow root.
- * Args: `message` is the extension runtime payload; `_sender` and `_response` are unused runtime callback arguments.
- * Returns: `true` when a prompt was rendered, otherwise `false`.
- * Examples: `onBackgroundMessage({ type: "showApproval", requestId: "r-1", scopes: ["tabs"] })`; `onBackgroundMessage({ type: "unknown" })` returns `false`.
+ * Purpose: receive every background -> content command and dispatch it to its dedicated handler.
+ * Args: `message` is the untrusted extension runtime payload; `_sender` and `_response` are unused runtime callback arguments.
+ * Returns: `true` when a known command was handled, otherwise `false`.
+ * Examples: `onBackgroundMessage({ type: "showApproval", requestId: "r-1", scopes: ["tabs"] }, sender, respond)` returns `true`; `onBackgroundMessage({ type: "unknown" }, sender, respond)` returns `false`.
  */
 function onBackgroundMessage(message: unknown, _sender: chrome.runtime.MessageSender, _response: (response?: unknown) => void): boolean {
-  if (!isApprovalPrompt(message)) return false;
-  showApprovalOverlay(message);
-  return true;
+  if (isShowApprovalMessage(message)) {
+    showApprovalOverlay(message);
+    return true;
+  }
+  if (isShowAskMessage(message)) {
+    showAskOverlay(message);
+    return true;
+  }
+  if (isDismissOverlaysMessage(message)) {
+    const dismissed = dismissOverlays();
+    void chrome.runtime.sendMessage(buildDismissOverlaysResponseMessage(message.requestId, dismissed));
+    return true;
+  }
+  if (isSolveCaptchaMessage(message)) {
+    const outcome = solveCaptcha(message);
+    void chrome.runtime.sendMessage(buildSolveCaptchaResponseMessage(message.requestId, outcome.detected, outcome.clicked, outcome.reason));
+    return true;
+  }
+  if (isSetDateMessage(message)) {
+    const applied = setDateField(message);
+    void chrome.runtime.sendMessage(buildSetDateResponseMessage(message.requestId, applied));
+    return true;
+  }
+  if (isSetComboboxMessage(message)) {
+    const matched = setComboboxField(message);
+    void chrome.runtime.sendMessage(buildSetComboboxResponseMessage(message.requestId, matched));
+    return true;
+  }
+  if (isDropFileMessage(message)) {
+    const dropped = dropFileOnElement(message);
+    void chrome.runtime.sendMessage(buildDropFileResponseMessage(message.requestId, dropped));
+    return true;
+  }
+  return false;
 }
 
 /**
- * Purpose: validate the redacted message shape permitted to create an overlay.
- * Args: `value` is an untrusted runtime message.
- * Returns: `true` when the message includes only a bounded request ID and scopes.
- * Examples: `isApprovalPrompt({ type: "showApproval", requestId: "r-1", scopes: ["tabs"] })` is `true`; `isApprovalPrompt({ type: "showApproval", requestId: "", scopes: [] })` is `false`.
- */
-function isApprovalPrompt(value: unknown): value is ApprovalPrompt {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return record.type === "showApproval" && typeof record.requestId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(record.requestId) && Array.isArray(record.scopes) && record.scopes.length > 0 && record.scopes.every((scope) => typeof scope === "string");
-}
-
-/**
- * Purpose: show a page-isolated, non-secret confirmation interface for one snapshot request.
- * Args: `prompt` contains the request ID and requested categories, never a secret or snapshot.
+ * Purpose: show a page-isolated, non-secret confirmation interface for one gated daemon action.
+ * Args: `prompt` contains the request ID and redacted action-category scopes, never a secret or raw payload.
  * Returns: nothing; one user click sends an approval response and removes the overlay.
- * Examples: `showApprovalOverlay({ type: "showApproval", requestId: "r-1", scopes: ["bookmarks"] })`; `showApprovalOverlay({ type: "showApproval", requestId: "r-2", scopes: ["tabs", "workspaceHints"] })`.
+ * Examples: `showApprovalOverlay({ type: "showApproval", requestId: "r-1", scopes: ["bookmark.create"] })`; `showApprovalOverlay({ type: "showApproval", requestId: "r-2", scopes: ["group.move"] })`.
  */
-function showApprovalOverlay(prompt: ApprovalPrompt): void {
-  document.getElementById("browser-proxy-approval")?.remove();
+function showApprovalOverlay(prompt: ShowApprovalMessage): void {
+  removeOverlay("browser-proxy-approval");
   const host = document.createElement("div");
   host.id = "browser-proxy-approval";
   const root = host.attachShadow({ mode: "closed" });
-  root.innerHTML = `<style>:host{all:initial}section{position:fixed;right:24px;bottom:24px;z-index:2147483647;max-width:360px;padding:18px;background:#111827;color:#f9fafb;border:1px solid #60a5fa;border-radius:10px;font:14px system-ui;box-shadow:0 8px 28px #0008}button{margin:10px 8px 0 0;padding:7px 12px;border-radius:6px;border:0;font:inherit;cursor:pointer}#approve{background:#2563eb;color:white}#deny{background:#374151;color:white}</style><section role="dialog" aria-modal="true" aria-label="Browser Proxy approval"><strong>Approve browser snapshot?</strong><p>The local browser-proxyd requests: ${prompt.scopes.map(escapeHtml).join(", ")}.</p><p>No page content, credentials, or secret will be shared.</p><button id="approve" type="button">Approve once</button><button id="deny" type="button">Deny</button></section>`;
-  root.getElementById("approve")?.addEventListener("click", () => respond(prompt.requestId, true, host));
-  root.getElementById("deny")?.addEventListener("click", () => respond(prompt.requestId, false, host));
+  root.innerHTML = `<style>${OVERLAY_STYLE}</style><section role="dialog" aria-modal="true" aria-label="Browser Proxy approval"><strong>Approve browser action?</strong><p>The local browser-proxyd requests: ${prompt.scopes.map(escapeHtml).join(", ")}.</p><p>No page content, credentials, or secret will be shared.</p><button id="approve" type="button">Approve once</button><button id="deny" type="button">Deny</button></section>`;
+  root.getElementById("approve")?.addEventListener("click", () => respondApproval(prompt.requestId, true, host));
+  root.getElementById("deny")?.addEventListener("click", () => respondApproval(prompt.requestId, false, host));
   document.documentElement.append(host);
 }
 
 /**
- * Purpose: send a single user decision to the background worker and remove the page overlay.
+ * Purpose: send a single user approval decision to the background worker and remove the page overlay.
  * Args: `requestId` identifies the prompt; `approved` is the click decision; `host` is the overlay root.
  * Returns: nothing.
- * Examples: `respond("r-1", true, host)` approves; `respond("r-1", false, host)` denies.
+ * Examples: `respondApproval("r-1", true, host)` approves; `respondApproval("r-1", false, host)` denies.
  */
-function respond(requestId: string, approved: boolean, host: HTMLElement): void {
+function respondApproval(requestId: string, approved: boolean, host: HTMLElement): void {
   host.remove();
-  void chrome.runtime.sendMessage({ type: "approvalResponse", requestId, approved });
+  void chrome.runtime.sendMessage(buildApprovalResponseMessage(requestId, approved));
 }
 
 /**
- * Purpose: prevent scope labels from being interpreted as HTML in the overlay.
- * Args: `value` is a scope string originating from a validated protocol message.
+ * Purpose: show a page-isolated text/password input overlay for one daemon-issued question.
+ * Args: `prompt` contains the request ID, the question text, and the desired input masking.
+ * Returns: nothing; submitting sends the typed answer and removes the overlay.
+ * Examples: `showAskOverlay({ type: "showAsk", requestId: "r-1", question: "2FA code?", inputType: "text" })`; `showAskOverlay({ type: "showAsk", requestId: "r-2", question: "Confirm password", inputType: "password" })`.
+ */
+function showAskOverlay(prompt: ShowAskMessage): void {
+  removeOverlay("browser-proxy-ask");
+  const host = document.createElement("div");
+  host.id = "browser-proxy-ask";
+  const root = host.attachShadow({ mode: "closed" });
+  const inputType = prompt.inputType === "password" ? "password" : "text";
+  root.innerHTML = `<style>${OVERLAY_STYLE}input{width:100%;box-sizing:border-box;margin-top:10px;padding:6px 8px;border-radius:6px;border:1px solid #4b5563;background:#1f2937;color:#f9fafb;font:inherit}</style><section role="dialog" aria-modal="true" aria-label="Browser Proxy question"><strong>${escapeHtml(prompt.question)}</strong><input id="answer" type="${inputType}" /><button id="submit" type="button">Submit</button></section>`;
+  const input = root.getElementById("answer") as HTMLInputElement | null;
+  root.getElementById("submit")?.addEventListener("click", () => {
+    const answer = input?.value ?? "";
+    host.remove();
+    void chrome.runtime.sendMessage(buildAskResponseMessage(prompt.requestId, answer));
+  });
+  document.documentElement.append(host);
+}
+
+/**
+ * Purpose: remove a previously rendered overlay host by id, if present.
+ * Args: `id` is the overlay host element id.
+ * Returns: nothing.
+ * Examples: `removeOverlay("browser-proxy-approval")`; `removeOverlay("browser-proxy-ask")`.
+ */
+function removeOverlay(id: string): void {
+  document.getElementById(id)?.remove();
+}
+
+/**
+ * Purpose: heuristically dismiss cookie/consent banners and other large fixed overlays on the page.
+ * Args: none; scans the live document.
+ * Returns: the number of overlay elements accepted or removed.
+ * Examples: `dismissOverlays()` on a page with a cookie banner returns `1`; `dismissOverlays()` on a clean page returns `0`.
+ */
+function dismissOverlays(): number {
+  let dismissed = 0;
+  const bySelector = document.querySelectorAll<HTMLElement>(
+    '[id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i], [id*="gdpr" i], [class*="gdpr" i]'
+  );
+  for (const element of bySelector) {
+    if (tryDismissElement(element)) dismissed++;
+  }
+  // Best-effort second pass: large fixed-position, high z-index overlays not caught by name heuristics.
+  for (const element of document.querySelectorAll<HTMLElement>("body *")) {
+    if (!element.isConnected) continue;
+    const style = getComputedStyle(element);
+    if (style.position !== "fixed") continue;
+    const zIndex = Number.parseInt(style.zIndex, 10);
+    if (Number.isNaN(zIndex) || zIndex < 1000) continue;
+    const rect = element.getBoundingClientRect();
+    const viewportArea = window.innerWidth * window.innerHeight;
+    if (viewportArea <= 0 || (rect.width * rect.height) / viewportArea < 0.3) continue;
+    if (tryDismissElement(element)) dismissed++;
+  }
+  return dismissed;
+}
+
+/**
+ * Purpose: dismiss one overlay element by clicking an accept-like control, else removing it outright.
+ * Args: `element` is a candidate overlay/banner root still attached to the document.
+ * Returns: `true` when a click or removal was performed.
+ * Examples: `tryDismissElement(cookieBannerWithAcceptButton)` clicks "Accept" and returns `true`; `tryDismissElement(bannerWithoutButtons)` removes it and returns `true`.
+ */
+function tryDismissElement(element: HTMLElement): boolean {
+  if (!element.isConnected) return false;
+  const button = Array.from(element.querySelectorAll<HTMLElement>("button, a, [role='button']")).find((candidate) => /accept|agree|got it|ok/iu.test(candidate.textContent ?? ""));
+  if (button) {
+    button.click();
+    return true;
+  }
+  element.remove();
+  return true;
+}
+
+/**
+ * Purpose: best-effort, same-origin-only captcha detection/interaction (checkbox reCAPTCHA/hCaptcha only).
+ * Args: `message` selects `detect`, `click_checkbox`, or `click_grid`.
+ * Returns: whether a captcha iframe was detected and whether a click was dispatched, with an honest `reason` for partial support.
+ * Examples: `solveCaptcha({ type:"solveCaptcha", requestId:"r-1", action:"detect" })` on a page with reCAPTCHA returns `{ detected: true, clicked: false }`; `solveCaptcha({ type:"solveCaptcha", requestId:"r-2", action:"click_grid" })` returns `{ detected, clicked: false, reason: "grid solving not implemented" }`.
+ */
+function solveCaptcha(message: SolveCaptchaMessage): { detected: boolean; clicked: boolean; reason?: string } {
+  const iframe = document.querySelector<HTMLIFrameElement>('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
+  const detected = iframe !== null;
+  if (message.action === "detect") return { detected, clicked: false };
+  if (message.action === "click_grid") return { detected, clicked: false, reason: "grid solving not implemented" };
+  // click_checkbox
+  if (!iframe) return { detected, clicked: false, reason: "no captcha iframe found" };
+  // Cross-origin iframes cannot be reached "inside" from a content script for browser-security reasons.
+  // This dispatches a same-origin-only best-effort synthetic click on the iframe's outer element;
+  // reliable click-through on a cross-origin checkbox requires CDP-level input dispatch (see the
+  // Python daemon's own `page-click` action, which already does this at the browser level).
+  const rect = iframe.getBoundingClientRect();
+  iframe.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }));
+  return { detected, clicked: true, reason: "same-origin best-effort only; cross-origin click-through is not implemented here" };
+}
+
+/**
+ * Purpose: set a native `<input type="date">` field and fire the events frameworks listen for.
+ * Args: `message` names the CSS `selector` and the ISO date `value` to apply.
+ * Returns: `true` when a matching `<input>` element was found and set.
+ * Examples: `setDateField({ type:"setDate", requestId:"r-1", selector:"#birthdate", value:"1990-01-01" })` returns `true` if `#birthdate` exists; returns `false` for a missing selector. MUI/AntD custom date pickers are NOT supported (documented gap, not a native `<input>`).
+ */
+function setDateField(message: SetDateMessage): boolean {
+  const element = document.querySelector(message.selector);
+  if (!(element instanceof HTMLInputElement)) return false;
+  element.value = message.value;
+  element.dispatchEvent(new Event("input", { bubbles: true }));
+  element.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+/**
+ * Purpose: heuristically type into and select from a combobox/autocomplete widget.
+ * Args: `message` names the CSS `selector` for the widget and the `value` to type and match.
+ * Returns: `true` when a visible option matching `value` was found and clicked.
+ * Examples: `setComboboxField({ type:"setCombobox", requestId:"r-1", selector:"#country", value:"France" })` returns `true` when an option "France" appears and is clicked; returns `false` when no option matches (best-effort, no MUI/AntD-specific wiring).
+ */
+function setComboboxField(message: SetComboboxMessage): boolean {
+  const element = document.querySelector<HTMLElement>(message.selector);
+  if (!element) return false;
+  element.click();
+  const textInput = element instanceof HTMLInputElement ? element : element.querySelector<HTMLInputElement>("input");
+  if (textInput) {
+    textInput.focus();
+    textInput.value = message.value;
+    textInput.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  const target = message.value.trim().toLowerCase();
+  const options = document.querySelectorAll<HTMLElement>('[role="option"], li, [role="listitem"]');
+  const match = Array.from(options).find((option) => (option.textContent ?? "").trim().toLowerCase() === target);
+  if (!match) return false;
+  match.click();
+  return true;
+}
+
+/**
+ * Purpose: synthesize a drag-and-drop file upload onto a drop target using a decoded in-memory `File`.
+ * Args: `message` names the `selector`, `filename`, base64 `contentBase64`, and `mimeType` of the file to drop.
+ * Returns: `true` when the drop target was found and the synthetic drag/drop event sequence was dispatched.
+ * Examples: `dropFileOnElement({ type:"dropFile", requestId:"r-1", selector:"#dropzone", filename:"a.png", contentBase64:"AA==", mimeType:"image/png" })` returns `true`; a missing selector returns `false`.
+ */
+function dropFileOnElement(message: DropFileMessage): boolean {
+  const element = document.querySelector<HTMLElement>(message.selector);
+  if (!element) return false;
+  const binary = atob(message.contentBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  const file = new File([bytes], message.filename, { type: message.mimeType });
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(file);
+  for (const type of ["dragenter", "dragover", "drop"] as const) {
+    element.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer }));
+  }
+  return true;
+}
+
+/**
+ * Purpose: prevent user-supplied text from being interpreted as HTML in any overlay.
+ * Args: `value` is a string originating from a validated protocol message.
  * Returns: an HTML-escaped display string.
  * Examples: `escapeHtml("tabs")` returns `"tabs"`; `escapeHtml("<x>")` returns `"&lt;x&gt;"`.
  */
 function escapeHtml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
+
+const OVERLAY_STYLE =
+  ":host{all:initial}section{position:fixed;right:24px;bottom:24px;z-index:2147483647;max-width:360px;padding:18px;background:#111827;color:#f9fafb;border:1px solid #60a5fa;border-radius:10px;font:14px system-ui;box-shadow:0 8px 28px #0008}button{margin:10px 8px 0 0;padding:7px 12px;border-radius:6px;border:0;font:inherit;cursor:pointer}#approve,#submit{background:#2563eb;color:white}#deny{background:#374151;color:white}";
 
 chrome.runtime.onMessage.addListener(onBackgroundMessage);
