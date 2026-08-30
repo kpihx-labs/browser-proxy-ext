@@ -3,14 +3,26 @@
   "name": "Browser Proxy Bridge for Microsoft Edge",
   "version": "0.3.0",
   "description": "A local, approval-gated bridge between Microsoft Edge and browser-proxyd.",
-  "permissions": ["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management"],
+  "permissions": ["bookmarks", "tabs", "tabGroups", "storage", "alarms", "management", "clipboardRead", "clipboardWrite", "offscreen"],
   "host_permissions": [],
   "background": {
     "service_worker": "dist/background.js",
     "type": "module"
   },
+  "icons": {
+    "16": "assets/logo-16.png",
+    "32": "assets/logo-32.png",
+    "48": "assets/logo-48.png",
+    "128": "assets/logo-128.png"
+  },
   "action": {
-    "default_title": "Browser Proxy Bridge"
+    "default_title": "Browser Proxy Bridge",
+    "default_icon": {
+      "16": "assets/logo-16.png",
+      "32": "assets/logo-32.png",
+      "48": "assets/logo-48.png",
+      "128": "assets/logo-128.png"
+    }
   },
   "options_page": "options.html",
   "content_scripts": [

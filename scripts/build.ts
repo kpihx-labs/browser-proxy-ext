@@ -6,7 +6,7 @@
  */
 async function buildExtension(): Promise<void> {
   const result = await Bun.build({
-    entrypoints: ["src/background.ts", "src/content.ts", "src/options.ts"],
+    entrypoints: ["src/background.ts", "src/content.ts", "src/options.ts", "src/offscreen.ts"],
     outdir: "dist",
     target: "browser",
     format: "esm",

@@ -2226,7 +2226,50 @@ export async function handleTabCaptureNext(payload: unknown): Promise<Record<str
   }
 }
 
+async function handleClipboardRead(): Promise<Record<string, unknown>> {
+  if (!chrome.offscreen) {
+    throw new Error("clipboard.read requires chrome.offscreen (Manifest V3)");
+  }
+  const hasDocument = await chrome.offscreen.hasDocument();
+  if (!hasDocument) {
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.CLIPBOARD],
+      justification: "Read system clipboard"
+    });
+  }
+  const response = await chrome.runtime.sendMessage({ target: "offscreen", type: "clipboard-read" });
+  if (response && typeof response.text === "string") {
+    return { text: response.text };
+  }
+  throw new Error("clipboard.read failed to receive text from offscreen document");
+}
+
+async function handleClipboardWrite(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isPlainRecord(payload) || typeof payload.text !== "string") {
+    throw new Error("clipboard.write requires {text: string}");
+  }
+  if (!chrome.offscreen) {
+    throw new Error("clipboard.write requires chrome.offscreen (Manifest V3)");
+  }
+  const hasDocument = await chrome.offscreen.hasDocument();
+  if (!hasDocument) {
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.CLIPBOARD],
+      justification: "Write system clipboard"
+    });
+  }
+  const response = await chrome.runtime.sendMessage({ target: "offscreen", type: "clipboard-write", text: payload.text });
+  if (response && response.status === "ok") {
+    return { written: true };
+  }
+  throw new Error("clipboard.write failed in offscreen document");
+}
+
 export const KIND_HANDLERS: Record<string, KindHandler> = {
+  "clipboard.read": () => handleClipboardRead(),
+  "clipboard.write": (payload) => handleClipboardWrite(payload),
   "bookmark.list": (payload) => handleBookmarkList(payload),
   "bookmark.get": (payload) => handleBookmarkGet(payload),
   "bookmark.create": (payload) => handleBookmarkCreate(payload),
