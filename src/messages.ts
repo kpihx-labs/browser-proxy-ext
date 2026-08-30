@@ -74,6 +74,17 @@ export interface SolveCaptchaResponseMessage {
   readonly detected: boolean;
   readonly clicked: boolean;
   readonly reason?: string;
+  /** The captcha iframe's own viewport-relative bounding rect (KπX, GRAVÉ — live-verified: a
+   * content-script `MouseEvent` dispatched on a genuinely cross-origin iframe element never
+   * reaches the checkbox rendered inside it; the daemon uses this rect to dispatch a REAL
+   * compositor-level CDP `Input.dispatchMouseEvent` instead — the same primitive
+   * `page-click-coordinates` already uses to reach cross-origin iframe content). Present only for
+   * a detected `click_checkbox` attempt. */
+  readonly rect?: { readonly left: number; readonly top: number; readonly width: number; readonly height: number };
+  /** The active tab's own `window.location.href`, letting the daemon correlate this content
+   * script's tab against its CDP `target_id` (the two id systems have no first-class mapping).
+   * Present only alongside `rect`. */
+  readonly url?: string;
 }
 
 /** Background -> content: set a native `<input type="date">` field and fire change events. */
@@ -327,12 +338,27 @@ export function isSolveCaptchaMessage(value: unknown): value is SolveCaptchaMess
 
 /**
  * Purpose: build the honest outcome of a captcha detection/interaction attempt.
- * Args: `requestId` identifies the command; `detected` reports iframe presence; `clicked` reports a dispatched click; `reason` explains partial/no support.
+ * Args: `requestId` identifies the command; `detected` reports iframe presence; `clicked` reports a dispatched click; `reason` explains partial/no support; `rect`/`url` let the daemon escalate to a real CDP-level coordinate click.
  * Returns: a `SolveCaptchaResponseMessage`.
- * Examples: `buildSolveCaptchaResponseMessage("r-1", true, false, "grid solving not implemented")`; `buildSolveCaptchaResponseMessage("r-2", false, false)`.
+ * Examples: `buildSolveCaptchaResponseMessage("r-1", true, false, "grid solving not implemented")`; `buildSolveCaptchaResponseMessage("r-2", true, false, "reported iframe rect for CDP-level coordinate click", {left:0,top:0,width:304,height:78}, "https://example.com/")`.
  */
-export function buildSolveCaptchaResponseMessage(requestId: string, detected: boolean, clicked: boolean, reason?: string): SolveCaptchaResponseMessage {
-  return reason === undefined ? { type: "solveCaptchaResponse", requestId, detected, clicked } : { type: "solveCaptchaResponse", requestId, detected, clicked, reason };
+export function buildSolveCaptchaResponseMessage(
+  requestId: string,
+  detected: boolean,
+  clicked: boolean,
+  reason?: string,
+  rect?: { left: number; top: number; width: number; height: number },
+  url?: string
+): SolveCaptchaResponseMessage {
+  return {
+    type: "solveCaptchaResponse",
+    requestId,
+    detected,
+    clicked,
+    ...(reason !== undefined ? { reason } : {}),
+    ...(rect !== undefined ? { rect } : {}),
+    ...(url !== undefined ? { url } : {}),
+  };
 }
 
 /**
@@ -342,11 +368,15 @@ export function buildSolveCaptchaResponseMessage(requestId: string, detected: bo
  * Examples: `isSolveCaptchaResponseMessage({type:"solveCaptchaResponse",requestId:"r-1",detected:true,clicked:false})` is `true`; `isSolveCaptchaResponseMessage({type:"solveCaptchaResponse",requestId:"r-1",detected:"yes",clicked:false})` is `false`.
  */
 export function isSolveCaptchaResponseMessage(value: unknown): value is SolveCaptchaResponseMessage {
-  return isReplyShape(
-    value,
-    "solveCaptchaResponse",
-    (record) => typeof record.detected === "boolean" && typeof record.clicked === "boolean" && (record.reason === undefined || typeof record.reason === "string")
-  );
+  return isReplyShape(value, "solveCaptchaResponse", (record) => {
+    if (typeof record.detected !== "boolean" || typeof record.clicked !== "boolean") return false;
+    if (record.reason !== undefined && typeof record.reason !== "string") return false;
+    if (record.url !== undefined && typeof record.url !== "string") return false;
+    if (record.rect === undefined) return true;
+    if (!isPlainRecord(record.rect)) return false;
+    const { left, top, width, height } = record.rect;
+    return typeof left === "number" && typeof top === "number" && typeof width === "number" && typeof height === "number";
+  });
 }
 
 /**

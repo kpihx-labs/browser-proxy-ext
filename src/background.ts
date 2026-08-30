@@ -836,7 +836,16 @@ function matchContentReply(message: unknown): { requestId: string; data: Record<
   if (isAskResponseMessage(message)) return { requestId: message.requestId, data: { answer: message.answer } };
   if (isDismissOverlaysResponseMessage(message)) return { requestId: message.requestId, data: { dismissed: message.dismissed } };
   if (isSolveCaptchaResponseMessage(message)) {
-    return { requestId: message.requestId, data: { detected: message.detected, clicked: message.clicked, ...(message.reason !== undefined ? { reason: message.reason } : {}) } };
+    return {
+      requestId: message.requestId,
+      data: {
+        detected: message.detected,
+        clicked: message.clicked,
+        ...(message.reason !== undefined ? { reason: message.reason } : {}),
+        ...(message.rect !== undefined ? { rect: message.rect } : {}),
+        ...(message.url !== undefined ? { url: message.url } : {}),
+      },
+    };
   }
   if (isSetDateResponseMessage(message)) return { requestId: message.requestId, data: { applied: message.applied } };
   if (isSetComboboxResponseMessage(message)) return { requestId: message.requestId, data: { matched: message.matched } };
@@ -1452,6 +1461,103 @@ export async function handleExtensionReload(): Promise<Record<string, unknown>> 
   return { reloading: true, id: self.id, name: self.name, version: self.version };
 }
 
+/** Callable chrome.* methods deliberately REFUSED by `chrome.call` — self-destructive or
+ * user-gesture-only calls that would sever the bridge, kill this extension, or require a real
+ * DOM click that a WebSocket-triggered call can never provide (same live-verified platform
+ * restriction documented for `extension-uninstall` in CONTRACT.md). Every other `chrome.*`
+ * method the manifest's permissions expose remains reachable — absolute protocol flexibility,
+ * with only these few hard, platform-forced boundaries. */
+const CHROME_CALL_DENYLIST = new Set([
+  "management.uninstall", // chrome.management.uninstall requires a user gesture (live-verified)
+  "runtime.reload", // would kill this very extension mid-bridge — use extension.reload instead
+  "runtime.restart",
+  "runtime.setUninstallURL",
+  "runtime.requestUpdateCheck",
+]);
+
+/**
+ * Purpose: recursively convert an arbitrary chrome.* API result into a JSON-safe value.
+ * Args: `value` is any result returned by a `chrome.*` call — plain data, nested objects,
+ * arrays, functions, `undefined`, `Date`, `Error`, or a circular structure.
+ * Returns: a plain JSON-serializable value (functions/`undefined` dropped, `Date`→ISO string,
+ * `Error`→message string, `Map`→entries object, `Set`→array, shared/circular references
+ * flattened to `"<Circular>"`), never throwing on exotic shapes.
+ * Examples: `chromeApiResultToJson(undefined)` is `undefined`;
+ * `chromeApiResultToJson({ a: 1, f: () => 1 })` is `{ a: 1 }`.
+ */
+function chromeApiResultToJson(value: unknown, seen?: WeakSet<object>): unknown {
+  if (value === null || value === undefined) return value ?? null;
+  const type = typeof value;
+  if (type === "number" || type === "boolean" || type === "string") return value;
+  if (type === "function" || type === "symbol" || type === "bigint") return null;
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Error) return { message: value.message, name: value.name };
+  if (value instanceof Map) {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of value.entries()) out[String(key)] = chromeApiResultToJson(val, seen);
+    return out;
+  }
+  if (value instanceof Set) return [...value].map((entry) => chromeApiResultToJson(entry, seen));
+  if (Array.isArray(value)) return value.map((entry) => chromeApiResultToJson(entry, seen));
+  const object = value as Record<string, unknown>;
+  const refs = seen ?? new WeakSet<object>();
+  if (refs.has(object)) return "<Circular>";
+  refs.add(object);
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(object)) {
+    out[key] = chromeApiResultToJson(object[key], refs);
+  }
+  return out;
+}
+
+/**
+ * Purpose: resolve and call a `chrome.*` method dynamically by dotted path — the `ext` family of
+ * the unlimited `do raw` gateway (KπX, GRAVÉ: "il devrait permettre de faire tout ce que les
+ * autres do permettent et en plus d'autres choses... sans figer le protocole").
+ * Args: `payload` must be `{method: string, params?: object | unknown[]}` — `method` is dotted
+ * chrome namespace + method (`"bookmarks.getTree"`, `"tabs.query"`, `"storage.local.get"`);
+ * `params` is EITHER an object (passed as the single argument) OR an array (spread as positional
+ * arguments, e.g. `[null]` for `storage.local.get(null)`).
+ * Returns: `{method, result}` where `result` is the chrome API's resolved value, made JSON-safe.
+ * Raises: unknown method/namespace (clear message naming the exact method), a denylisted method
+ * (see `CHROME_CALL_DENYLIST` — points at the sanctioned alternative), or the chrome API's own
+ * rejection, surfaced verbatim.
+ * Examples: `handleChromeCall({method:"bookmarks.getTree"})` returns full bookmark tree;
+ * `handleChromeCall({method:"tabs.query",params:{active:true,currentWindow:true}})` returns the
+ * active tab; `handleChromeCall({method:"storage.local.get",params:[null]})` returns all storage.
+ */
+export async function handleChromeCall(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isPlainRecord(payload) || typeof payload.method !== "string" || payload.method.length === 0) {
+    throw new Error("chrome.call requires {method: string} (dotted chrome.* path, e.g. 'bookmarks.getTree')");
+  }
+  const method = payload.method;
+  if (CHROME_CALL_DENYLIST.has(method)) {
+    const alternative = method === "runtime.reload" ? "extension.reload" : "a real user click in edge://extensions/";
+    throw new Error(`chrome.call: "${method}" is deliberately refused — use ${alternative} instead`);
+  }
+  const segments = method.split(".");
+  if (segments.length < 2) {
+    throw new Error(`chrome.call: "${method}" must be a dotted namespace.method (e.g. 'tabs.query')`);
+  }
+  const namespace = segments[0] as keyof typeof chrome;
+  const memberPath = segments.slice(1);
+  let target: unknown = (chrome as unknown as Record<string, unknown>)[namespace];
+  for (const segment of memberPath) {
+    if (!isPlainRecord(target)) {
+      throw new Error(`chrome.call: namespace/method "${method}" does not exist`);
+    }
+    target = (target as Record<string, unknown>)[segment];
+  }
+  if (typeof target !== "function") {
+    throw new Error(`chrome.call: "${method}" is not a callable chrome.* method`);
+  }
+  const fn = target as (...args: unknown[]) => Promise<unknown> | unknown;
+  const params = payload.params;
+  const args: unknown[] = Array.isArray(params) ? params : (params === undefined ? [] : [params]);
+  const result = await fn.apply((chrome as unknown as Record<string, unknown>)[namespace], args);
+  return { method, result: chromeApiResultToJson(result) };
+}
+
 /** One real tab entry inside `computeWindowLayouts()`'s per-window canonical layout. */
 interface WindowLayoutTab {
   readonly chrome_tab_id: number;
@@ -2001,15 +2107,22 @@ function isCaptchaSolvePayload(value: unknown): value is { action: CaptchaAction
 }
 
 /**
- * Purpose: run a best-effort, same-origin-only captcha detection/interaction on the active tab.
+ * Purpose: run a captcha detection/interaction on the active tab, reporting the iframe rect + tab
+ * url for `click_checkbox` so the daemon can escalate to a real CDP-level coordinate click.
  * Args: `payload` must be `{action, cells?}`. Image-grid solving (`click_grid`) is honestly reported as unimplemented.
- * Returns: `{detected, clicked, reason?}`.
- * Examples: `handleCaptchaSolve({action:"detect"})`; `handleCaptchaSolve({action:"click_grid"})` returns `{detected, clicked:false, reason:"grid solving not implemented"}`.
+ * Returns: `{detected, clicked, reason?, rect?, url?}`.
+ * Examples: `handleCaptchaSolve({action:"detect"})`; `handleCaptchaSolve({action:"click_grid"})` returns `{detected, clicked:false, reason:"grid solving not implemented"}`; `handleCaptchaSolve({action:"click_checkbox"})` on a real reCAPTCHA returns `{detected:true, clicked:false, reason:"reported iframe rect for CDP-level coordinate click", rect:{...}, url:"https://..."}`.
  */
 export async function handleCaptchaSolve(payload: unknown): Promise<Record<string, unknown>> {
   if (!isCaptchaSolvePayload(payload)) throw new Error("captcha.solve requires {action: 'detect'|'click_checkbox'|'click_grid', cells?: number[]}");
   const reply = await sendToHostTab((requestId) => buildSolveCaptchaMessage(requestId, payload.action, payload.cells));
-  return { detected: reply.detected, clicked: reply.clicked, ...(reply.reason !== undefined ? { reason: reply.reason } : {}) };
+  return {
+    detected: reply.detected,
+    clicked: reply.clicked,
+    ...(reply.reason !== undefined ? { reason: reply.reason } : {}),
+    ...(reply.rect !== undefined ? { rect: reply.rect } : {}),
+    ...(reply.url !== undefined ? { url: reply.url } : {}),
+  };
 }
 
 /**
@@ -2141,6 +2254,7 @@ export const KIND_HANDLERS: Record<string, KindHandler> = {
   "form.set_combobox": (payload) => handleFormSetCombobox(payload),
   "form.drop_file": (payload) => handleFormDropFile(payload),
   "tab.capture_next": (payload) => handleTabCaptureNext(payload),
+  "chrome.call": (payload) => handleChromeCall(payload),
 };
 
 chrome.runtime.onMessage.addListener(onRuntimeMessage);

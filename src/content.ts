@@ -43,7 +43,9 @@ function onBackgroundMessage(message: unknown, _sender: chrome.runtime.MessageSe
   }
   if (isSolveCaptchaMessage(message)) {
     const outcome = solveCaptcha(message);
-    void chrome.runtime.sendMessage(buildSolveCaptchaResponseMessage(message.requestId, outcome.detected, outcome.clicked, outcome.reason));
+    void chrome.runtime.sendMessage(
+      buildSolveCaptchaResponseMessage(message.requestId, outcome.detected, outcome.clicked, outcome.reason, outcome.rect, outcome.url)
+    );
     return true;
   }
   if (isSetDateMessage(message)) {
@@ -158,13 +160,30 @@ function dismissOverlays(): number {
  * Purpose: dismiss one overlay element by clicking an accept-like control, else removing it outright.
  * Args: `element` is a candidate overlay/banner root still attached to the document.
  * Returns: `true` when a click or removal was performed.
- * Examples: `tryDismissElement(cookieBannerWithAcceptButton)` clicks "Accept" and returns `true`; `tryDismissElement(bannerWithoutButtons)` removes it and returns `true`.
+ * Notes: the accept-text regex uses word boundaries around the short, substring-prone terms
+ *   (`agree`, `got it`, `ok`) so `ok` never matches as a false-positive substring of an unrelated
+ *   word (live-verified real-world bug, KπX, GRAVÉ: on a real multi-layer consent flow the second
+ *   pass matched a "JEUX SUDOKU" navigation link — "sudoku" literally contains "ok" as a bare
+ *   substring — and clicked it instead of the real "Accepter" button, navigating away from the
+ *   page entirely). `accept` deliberately keeps only a LEADING boundary (`\baccept`, no trailing
+ *   `\b`) so it still matches localized suffixed forms (`Accepter`, `Acceptez`, `j'accepte`).
+ *   When several elements match, a real `<button>` is preferred over `<a>`/`[role=button]`
+ *   (navigation links are almost always anchors), then the shortest matching text (the real
+ *   control is short; a false-positive match buried inside a long nav link's text is not).
+ * Examples: `tryDismissElement(cookieBannerWithAcceptButton)` clicks "Accept" and returns `true`; `tryDismissElement(bannerWithoutButtons)` removes it and returns `true`; a banner containing both a "JEUX SUDOKU" link and a real "Accepter" button clicks the button, never the link.
  */
 function tryDismissElement(element: HTMLElement): boolean {
   if (!element.isConnected) return false;
-  const button = Array.from(element.querySelectorAll<HTMLElement>("button, a, [role='button']")).find((candidate) => /accept|agree|got it|ok/iu.test(candidate.textContent ?? ""));
-  if (button) {
-    button.click();
+  const ACCEPT_LIKE = /\baccept|\bagree\b|\bgot it\b|\bok\b/iu;
+  const candidates = Array.from(element.querySelectorAll<HTMLElement>("button, a, [role='button']")).filter((candidate) => ACCEPT_LIKE.test(candidate.textContent ?? ""));
+  const winner = candidates.sort((a, b) => {
+    const aIsButton = a.tagName === "BUTTON" ? 0 : 1;
+    const bIsButton = b.tagName === "BUTTON" ? 0 : 1;
+    if (aIsButton !== bIsButton) return aIsButton - bIsButton;
+    return (a.textContent ?? "").trim().length - (b.textContent ?? "").trim().length;
+  })[0];
+  if (winner) {
+    winner.click();
     return true;
   }
   element.remove();
@@ -172,25 +191,36 @@ function tryDismissElement(element: HTMLElement): boolean {
 }
 
 /**
- * Purpose: best-effort, same-origin-only captcha detection/interaction (checkbox reCAPTCHA/hCaptcha only).
+ * Purpose: detect a CAPTCHA iframe and, for `click_checkbox`, report its rect so the daemon can
+ * escalate to a REAL compositor-level CDP click (checkbox reCAPTCHA/hCaptcha only).
  * Args: `message` selects `detect`, `click_checkbox`, or `click_grid`.
- * Returns: whether a captcha iframe was detected and whether a click was dispatched, with an honest `reason` for partial support.
- * Examples: `solveCaptcha({ type:"solveCaptcha", requestId:"r-1", action:"detect" })` on a page with reCAPTCHA returns `{ detected: true, clicked: false }`; `solveCaptcha({ type:"solveCaptcha", requestId:"r-2", action:"click_grid" })` returns `{ detected, clicked: false, reason: "grid solving not implemented" }`.
+ * Returns: whether a captcha iframe was detected; for `click_checkbox` when detected, the
+ *   iframe's own viewport-relative bounding `rect` and this tab's `url` instead of an actual click
+ *   (KπX, GRAVÉ — live-verified against the official Google reCAPTCHA demo: a content-script
+ *   `MouseEvent` dispatched on the iframe's OUTER element never reaches the checkbox rendered
+ *   inside it, because Google's reCAPTCHA anchor iframe is ALWAYS served cross-origin from
+ *   `www.google.com` in every real deployment — confirmed live via the iframe's own `src`. Reading
+ *   a cross-origin iframe ELEMENT's geometry from the parent document is legal; only its rendered
+ *   CONTENT is blocked. The daemon reaches the real checkbox with `Input.dispatchMouseEvent` at
+ *   these coordinates — the same CDP primitive `page-click-coordinates` already uses for exactly
+ *   this "no selector can address it" case).
+ * Examples: `solveCaptcha({ type:"solveCaptcha", requestId:"r-1", action:"detect" })` on a page with reCAPTCHA returns `{ detected: true, clicked: false }`; `solveCaptcha({ type:"solveCaptcha", requestId:"r-2", action:"click_grid" })` returns `{ detected, clicked: false, reason: "grid solving not implemented" }`; `solveCaptcha({ type:"solveCaptcha", requestId:"r-3", action:"click_checkbox" })` on a real reCAPTCHA returns `{ detected: true, clicked: false, reason: "reported iframe rect for CDP-level coordinate click", rect: {...}, url: location.href }`.
  */
-function solveCaptcha(message: SolveCaptchaMessage): { detected: boolean; clicked: boolean; reason?: string } {
+function solveCaptcha(message: SolveCaptchaMessage): { detected: boolean; clicked: boolean; reason?: string; rect?: { left: number; top: number; width: number; height: number }; url?: string } {
   const iframe = document.querySelector<HTMLIFrameElement>('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]');
   const detected = iframe !== null;
   if (message.action === "detect") return { detected, clicked: false };
   if (message.action === "click_grid") return { detected, clicked: false, reason: "grid solving not implemented" };
   // click_checkbox
   if (!iframe) return { detected, clicked: false, reason: "no captcha iframe found" };
-  // Cross-origin iframes cannot be reached "inside" from a content script for browser-security reasons.
-  // This dispatches a same-origin-only best-effort synthetic click on the iframe's outer element;
-  // reliable click-through on a cross-origin checkbox requires CDP-level input dispatch (see the
-  // Python daemon's own `page-click` action, which already does this at the browser level).
   const rect = iframe.getBoundingClientRect();
-  iframe.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }));
-  return { detected, clicked: true, reason: "same-origin best-effort only; cross-origin click-through is not implemented here" };
+  return {
+    detected,
+    clicked: false,
+    reason: "reported iframe rect for CDP-level coordinate click (cross-origin content-script click never reaches the real checkbox)",
+    rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+    url: window.location.href,
+  };
 }
 
 /**

@@ -714,6 +714,96 @@ describe("KIND_HANDLERS dispatch table", () => {
     expect(message.details).toEqual(["ids:", "  42", "", 'bookmark 42: "KpihX Labs" (https://kpihx-labs.com)']);
   });
 
+  test("chrome.call dynamically dispatches to chrome.bookmarks.getTree and returns a JSON-safe tree", async () => {
+    const handler = getHandler("chrome.call");
+    const result = (await handler({ method: "bookmarks.getTree" })) as { method: string; result: unknown };
+    expect(mocks.bookmarksGetTree).toHaveBeenCalled();
+    expect(result.method).toBe("bookmarks.getTree");
+    expect(result.result).toEqual([
+      {
+        id: "0",
+        title: "",
+        children: [
+          {
+            id: "1",
+            title: "Bookmarks bar",
+            parentId: "0",
+            index: 0,
+            children: [
+              { id: "42", title: "KpihX Labs", url: "https://kpihx-labs.com", parentId: "1", index: 0 },
+            ],
+          },
+          { id: "2", title: "Other bookmarks", parentId: "0", index: 1, children: [] },
+        ],
+      },
+    ]);
+  });
+
+  test("chrome.call spreads an array params as positional arguments (storage.local.get([null]))", async () => {
+    const handler = getHandler("chrome.call");
+    mocks.storageLocalGet.mockClear();
+    mocks.storageLocalGet.mockImplementationOnce(async (keys: unknown) => ({ fromKeys: keys }) as Record<string, unknown>);
+    const result = (await handler({ method: "storage.local.get", params: [null] })) as { result: { fromKeys: unknown } };
+    expect(mocks.storageLocalGet).toHaveBeenCalledWith(null);
+    expect(result.result.fromKeys).toBeNull();
+  });
+
+  test("chrome.call passes an object params as the single argument (tabs.query({active:true}))", async () => {
+    const handler = getHandler("chrome.call");
+    mocks.tabsQueryByGroup.mockClear();
+    const fakeTabs = [
+      {
+        id: 5,
+        title: "Tab",
+        url: "https://x",
+        active: true,
+        windowId: 1,
+        index: 0,
+        groupId: -1,
+        pinned: false,
+      },
+    ] as const;
+    mocks.tabsQueryByGroup.mockImplementationOnce(async () => [...fakeTabs]);
+    const result = (await handler({ method: "tabs.query", params: { active: true, currentWindow: true } })) as {
+      result?: Array<{ id: number }>;
+    };
+    expect(mocks.tabsQueryByGroup).toHaveBeenCalledWith({ active: true, currentWindow: true });
+    expect(result.result?.[0]?.id).toBe(5);
+  });
+
+  test("chrome.call refuses denylisted methods with the sanctioned alternative named", async () => {
+    const handler = getHandler("chrome.call");
+    await expect(handler({ method: "management.uninstall", params: { id: "x" } })).rejects.toThrow(/edge:\/\/extensions/);
+    await expect(handler({ method: "runtime.reload" })).rejects.toThrow(/extension\.reload/);
+  });
+
+  test("chrome.call fails closed for an unknown method, unknown namespace, and malformed payload", async () => {
+    const handler = getHandler("chrome.call");
+    await expect(handler({ method: "bookmarks.nonexistent" })).rejects.toThrow(/does not exist|not a callable/);
+    await expect(handler({ method: "noSuchNamespace.getTree" })).rejects.toThrow(/does not exist/);
+    await expect(handler({ method: "notDotted" })).rejects.toThrow(/dotted/);
+    await expect(handler({})).rejects.toThrow(/chrome\.call requires/);
+  });
+
+  test("chrome.call result normalization drops functions and converts Date/Map/Set safely", async () => {
+    const handler = getHandler("chrome.call");
+    // Override a fake management.get to return exotic shapes to prove JSON-safety.
+    mocks.managementGet.mockImplementationOnce(async () => {
+      const exotic = {
+        id: "x",
+        name: "Y",
+        fn: () => "dropped",
+        created: new Date("2026-01-01T00:00:00Z"),
+      } as unknown as never;
+      return exotic;
+    });
+    const result = (await handler({ method: "management.get", params: { id: "x" } })) as {
+      result: { fn: unknown; created: string };
+    };
+    expect(result.result.fn).toBeNull();
+    expect(result.result.created).toBe("2026-01-01T00:00:00.000Z");
+  });
+
   test("group.create calls chrome.tabs.group then chrome.tabGroups.update with the right args", async () => {
     const handler = getHandler("group.create");
     const result = await handler({ tab_ids: [12, 13], title: "Research", color: "blue" });
@@ -1204,6 +1294,37 @@ describe("sendToHostTab (centralized tab-resolution/focus/retry for every non-ap
       await listener({ type: "askResponse", requestId: message.requestId, answer: "yes" }, { tab: { id: tabId } });
     }
     expect(await resultPromise).toEqual({ answer: "yes" });
+  });
+
+  test("captcha.solve click_checkbox passes through the content script's rect and url for CDP-level escalation", async () => {
+    mocks.tabsSendMessage.mockClear();
+    const handler = getHandler("captcha.solve");
+    const resultPromise = handler({ action: "click_checkbox" });
+    for (let attempt = 0; attempt < 50 && mocks.tabsSendMessage.mock.calls.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const [tabId, message] = mocks.tabsSendMessage.mock.calls[0] as [number, { requestId: string }];
+    for (const listener of mocks.onMessageListeners) {
+      await listener(
+        {
+          type: "solveCaptchaResponse",
+          requestId: message.requestId,
+          detected: true,
+          clicked: false,
+          reason: "reported iframe rect for CDP-level coordinate click",
+          rect: { left: 10, top: 20, width: 304, height: 78 },
+          url: "https://example.com/",
+        },
+        { tab: { id: tabId } }
+      );
+    }
+    expect(await resultPromise).toEqual({
+      detected: true,
+      clicked: false,
+      reason: "reported iframe rect for CDP-level coordinate click",
+      rect: { left: 10, top: 20, width: 304, height: 78 },
+      url: "https://example.com/",
+    });
   });
 
   test("captcha.solve retries via a fresh temporary tab when the found candidate's content script is stale, same centralized mechanism as approval", async () => {

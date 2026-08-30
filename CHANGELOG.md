@@ -2,6 +2,23 @@
 
 All notable changes are documented here.
 
+## 0.3.0 — 2026-08-30
+
+- **`dismissOverlays`/`tryDismissElement` fixed a live-verified real-world false positive**: the
+  accept-text regex (`/accept|agree|got it|ok/iu`) matched `ok` as a bare substring anywhere,
+  including inside an unrelated "JEUX SUDOKU" navigation link (`sudoku` literally contains `ok`),
+  clicking it instead of the real "Accepter" button on a real multi-layer consent flow and
+  navigating away from the page. Fixed with word boundaries around the substring-prone short terms
+  (`\bagree\b`, `\bgot it\b`, `\bok\b` — `accept` deliberately keeps only a LEADING boundary so
+  `Accepter`/`j'accepte` still match), plus a `<button>`-over-`<a>`, shortest-text-first preference
+  when several elements match.
+- **`solveCaptcha()` no longer attempts an always-ineffective same-origin content-script click for
+  `click_checkbox`**: live-verified against the official Google reCAPTCHA demo that the anchor
+  iframe is served cross-origin from `www.google.com` in every real deployment, so the previous
+  `MouseEvent` dispatch on the iframe's outer element never reached the checkbox rendered inside it.
+  Now reports the iframe's own bounding `rect` and the tab's `url` (new optional
+  `SolveCaptchaResponseMessage` fields) so the daemon can escalate to a real CDP-level click.
+
 ## 0.2.0 — 2026-08-29
 
 - **Fixed approval overlays silently failing whenever the active tab is this extension's OWN

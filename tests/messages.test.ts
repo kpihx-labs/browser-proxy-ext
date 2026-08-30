@@ -66,6 +66,20 @@ test("solveCaptchaResponse round trip, with and without a reason", () => {
   expect(isSolveCaptchaResponseMessage(buildSolveCaptchaResponseMessage("r-4", false, false))).toBe(true);
 });
 
+test("solveCaptchaResponse round trip with a CDP-escalation rect and url", () => {
+  const reply = buildSolveCaptchaResponseMessage(
+    "r-4b",
+    true,
+    false,
+    "reported iframe rect for CDP-level coordinate click",
+    { left: 10, top: 20, width: 304, height: 78 },
+    "https://example.com/"
+  );
+  expect(isSolveCaptchaResponseMessage(reply)).toBe(true);
+  expect(isSolveCaptchaResponseMessage({ ...reply, rect: { left: 1 } })).toBe(false);
+  expect(isSolveCaptchaResponseMessage({ ...reply, url: 42 })).toBe(false);
+});
+
 test("setDateResponse / setComboboxResponse / dropFileResponse round trips", () => {
   expect(isSetDateResponseMessage(buildSetDateResponseMessage("r-5", true))).toBe(true);
   expect(isSetComboboxResponseMessage(buildSetComboboxResponseMessage("r-6", false))).toBe(true);
