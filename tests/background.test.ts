@@ -256,7 +256,10 @@ function installChromeMock() {
         },
       },
     },
-    windows: { update: windowsUpdate },
+    windows: {
+      update: windowsUpdate,
+      getAll: mock(async () => [{ id: 1, type: "normal", incognito: false }]),
+    },
     runtime: {
       onMessage: { addListener: (fn: (message: unknown, sender: unknown) => unknown) => onMessageListeners.push(fn) },
       sendMessage: mock(async () => undefined),
@@ -893,6 +896,7 @@ describe("KIND_HANDLERS dispatch table", () => {
   });
 
   test("tab.update with an explicit index moves the tab directly, no chrome.tabs.get lookup needed", async () => {
+    mocks.tabsGet.mockClear();
     const handler = getHandler("tab.update");
     const result = await handler({ tab_id: 12, index: 0 });
     expect(mocks.tabsGet).not.toHaveBeenCalled();
@@ -1177,7 +1181,7 @@ describe("KIND_HANDLERS dispatch table", () => {
     const [secondAttemptTabId] = mocks.tabsSendMessage.mock.calls[1] as [number, unknown];
     expect(firstAttemptTabId).toBe(12);
     expect(secondAttemptTabId).toBe(555);
-    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true });
+    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true, windowId: 1 });
   });
 
   test("requestApproval creates a temporary tab as a last resort when NO http(s) tab exists anywhere, and shows the overlay there", async () => {
@@ -1188,9 +1192,11 @@ describe("KIND_HANDLERS dispatch table", () => {
       { id: 99, url: "edge://settings/profiles", title: "Settings", windowId: 1, index: 0, groupId: -1, active: true, pinned: false },
     ]);
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
+    // 3rd fallback: any normal-window http tab — also empty.
+    mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     await background.handleRequest({ type: "request", id: "req-approval-3", kind: "approval", payload: { action: "group-create" } });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true });
+    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true, windowId: 1 });
     expect(mocks.tabsSendMessage).toHaveBeenCalledTimes(1);
     const [tabId] = mocks.tabsSendMessage.mock.calls[0] as [number, unknown];
     expect(tabId).toBe(555);
@@ -1201,6 +1207,7 @@ describe("KIND_HANDLERS dispatch table", () => {
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => [
       { id: 99, url: "edge://settings/profiles", title: "Settings", windowId: 1, index: 0, groupId: -1, active: true, pinned: false },
     ]);
+    mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     await background.handleRequest({ type: "request", id: "req-approval-4", kind: "approval", payload: { action: "group-create" } });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1216,6 +1223,7 @@ describe("KIND_HANDLERS dispatch table", () => {
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => [
       { id: 99, url: "edge://settings/profiles", title: "Settings", windowId: 1, index: 0, groupId: -1, active: true, pinned: false },
     ]);
+    mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     await background.handleRequest({
       type: "request",
@@ -1336,13 +1344,14 @@ describe("sendToHostTab (centralized tab-resolution/focus/retry for every non-ap
     mocks.tabsQueryByGroup.mockImplementationOnce(async () => [
       { id: 12, url: "https://example.com", title: "Example", windowId: 1, index: 1, groupId: -1, active: false, pinned: false },
     ]);
+    mocks.tabsQueryByGroup.mockImplementationOnce(async () => []);
     mocks.tabsSendMessage.mockImplementationOnce(async () => {
       throw new Error("Could not establish connection. Receiving end does not exist.");
     });
     const handler = getHandler("captcha.solve");
     const resultPromise = handler({ action: "detect" });
     await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true });
+    expect(mocks.tabsCreate).toHaveBeenCalledWith({ url: "https://example.com/", active: true, windowId: 1 });
     const [tabId, message] = mocks.tabsSendMessage.mock.calls[1] as [number, { requestId: string }];
     expect(tabId).toBe(555);
     for (const listener of mocks.onMessageListeners) {

@@ -306,13 +306,17 @@ function isApprovableUrl(url: string | undefined): boolean {
  */
 async function getActiveTabId(): Promise<number> {
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (activeTab?.id && isApprovableUrl(activeTab.url)) return activeTab.id;
+  if (activeTab?.id && isApprovableUrl(activeTab.url) && !activeTab.incognito) return activeTab.id;
   const [fallbackTab] = await chrome.tabs.query({
     url: ["http://*/*", "https://*/*"],
     lastFocusedWindow: true,
   });
-  if (!fallbackTab?.id) throw new Error("No active tab available");
-  return fallbackTab.id;
+  if (fallbackTab?.id && !fallbackTab.incognito) return fallbackTab.id;
+  const [anyNormalTab] = await chrome.tabs.query({
+    url: ["http://*/*", "https://*/*"],
+  });
+  if (!anyNormalTab?.id || anyNormalTab.incognito) throw new Error("No active tab available");
+  return anyNormalTab.id;
 }
 
 /**
@@ -609,7 +613,15 @@ async function focusHostTab(tabId: number): Promise<void> {
  * temporary tab is always closed again once the interaction settles, never left behind.
  */
 async function createTemporaryHostTab(): Promise<number> {
-  const created = await chrome.tabs.create({ url: TEMPORARY_APPROVAL_TAB_URL, active: true });
+  let windowId: number | undefined;
+  try {
+    const allWindows = await chrome.windows.getAll();
+    const normalWindow = allWindows.find((w) => w.type === "normal" && !w.incognito);
+    if (normalWindow?.id) windowId = normalWindow.id;
+  } catch { /* no-op: tabs.create will use default window */ }
+  const createOpts: chrome.tabs.CreateProperties = { url: TEMPORARY_APPROVAL_TAB_URL, active: true };
+  if (windowId !== undefined) createOpts.windowId = windowId;
+  const created = await chrome.tabs.create(createOpts);
   if (!created.id) throw new Error("Failed to create a temporary host tab");
   if (created.windowId !== undefined) await chrome.windows.update(created.windowId, { focused: true });
   await waitForTabComplete(created.id);
@@ -678,6 +690,11 @@ async function tryShowApproval(
   const pending: PendingApproval = { request, tabId, temporaryTabId, expiresAt: Date.now() + timeoutMs };
   approvals.set(request.id, pending);
   try {
+    const tabInfo = await chrome.tabs.get(tabId).catch(() => null);
+    if (tabInfo?.incognito) {
+      approvals.delete(request.id);
+      return false;
+    }
     const details = await describeApprovalDetails(request);
     await chrome.tabs.sendMessage(
       tabId,
