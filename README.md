@@ -31,7 +31,7 @@ make check
 make build
 ```
 
-In Microsoft Edge, open `edge://extensions`, enable Developer mode, choose **Load unpacked**, and select this repository directory. Open the extension's **Details → Extension options** and provision the same shared secret as the local daemon **and** the exact browser-proxy profile name this Edge window belongs to (must match `admin edge start <profile>`/`profile-start`; defaults to `default`). The default local endpoint is `ws://127.0.0.1:8765/v1/extension`.
+In Microsoft Edge, open `edge://extensions`, enable Developer mode, choose **Load unpacked**, and select this repository directory. Open the extension's **Details → Extension options** and provision the same shared secret as the local daemon **and** the exact browser-proxy profile name this Edge window belongs to (must match `admin profile start <profile>`/`profile-start`; defaults to `default`). The default local endpoint is `ws://127.0.0.1:8765/v1/extension`.
 
 Each profile is a fully separate Edge install with its own copy of this extension and its own
 storage — the profile name is never shared or auto-discovered (Chrome extensions cannot see which
