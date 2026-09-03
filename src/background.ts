@@ -1742,9 +1742,10 @@ function isTabGroupColor(value: unknown): value is TabGroupColor {
  * Returns: `true` for `{tab_ids: number[], title?: string, color?: ColorEnum}` with at least one tab id.
  * Examples: `isGroupCreatePayload({tab_ids:[1,2]})` is `true`; `isGroupCreatePayload({tab_ids:[]})` is `false`.
  */
-function isGroupCreatePayload(value: unknown): value is { tab_ids: number[]; title?: string; color?: TabGroupColor } {
+function isGroupCreatePayload(value: unknown): value is { tab_ids: number[]; window_id: number; title?: string; color?: TabGroupColor } {
   if (!isPlainRecord(value)) return false;
   if (!Array.isArray(value.tab_ids) || value.tab_ids.length === 0 || !value.tab_ids.every((id) => typeof id === "number")) return false;
+  if (typeof value.window_id !== "number") return false;
   if (value.title !== undefined && typeof value.title !== "string") return false;
   return value.color === undefined || isTabGroupColor(value.color);
 }
@@ -1756,8 +1757,8 @@ function isGroupCreatePayload(value: unknown): value is { tab_ids: number[]; tit
  * Examples: `handleGroupCreate({tab_ids:[12,13], title:"Research", color:"blue"})`; `handleGroupCreate({tab_ids:[12]})`.
  */
 export async function handleGroupCreate(payload: unknown): Promise<Record<string, unknown>> {
-  if (!isGroupCreatePayload(payload)) throw new Error("group.create requires {tab_ids: number[], title?: string, color?: ColorEnum}");
-  const groupId = await chrome.tabs.group({ tabIds: payload.tab_ids });
+  if (!isGroupCreatePayload(payload)) throw new Error("group.create requires {tab_ids: number[], window_id: number, title?: string, color?: ColorEnum}");
+  const groupId = await chrome.tabs.group({ createProperties: { windowId: payload.window_id }, tabIds: payload.tab_ids });
   if (payload.title !== undefined || payload.color !== undefined) {
     await chrome.tabGroups.update(groupId, { title: payload.title, color: payload.color });
   }

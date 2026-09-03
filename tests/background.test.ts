@@ -809,15 +809,20 @@ describe("KIND_HANDLERS dispatch table", () => {
 
   test("group.create calls chrome.tabs.group then chrome.tabGroups.update with the right args", async () => {
     const handler = getHandler("group.create");
-    const result = await handler({ tab_ids: [12, 13], title: "Research", color: "blue" });
-    expect(mocks.tabsGroup).toHaveBeenCalledWith({ tabIds: [12, 13] });
+    const result = await handler({ tab_ids: [12, 13], window_id: 42, title: "Research", color: "blue" });
+    expect(mocks.tabsGroup).toHaveBeenCalledWith({ createProperties: { windowId: 42 }, tabIds: [12, 13] });
     expect(mocks.tabGroupsUpdate).toHaveBeenCalledWith(7, { title: "Research", color: "blue" });
     expect(result).toEqual({ group_id: 7, title: "Research", color: "blue" });
   });
 
   test("group.create rejects an empty tab_ids payload", async () => {
     const handler = getHandler("group.create");
-    await expect(handler({ tab_ids: [] })).rejects.toThrow();
+    await expect(handler({ tab_ids: [], window_id: 1 })).rejects.toThrow();
+  });
+
+  test("group.create rejects payload without window_id", async () => {
+    const handler = getHandler("group.create");
+    await expect(handler({ tab_ids: [1, 2] })).rejects.toThrow();
   });
 
   test("group.update calls chrome.tabGroups.update and returns the real updated group", async () => {
